@@ -124,6 +124,9 @@
 /* define if bluestore enabled */
 #cmakedefine WITH_BLUESTORE
 
+/* define if hsestore enabled */
+#cmakedefine WITH_HSESTORE
+
 /* define if cephfs enabled */
 #cmakedefine WITH_CEPHFS
 

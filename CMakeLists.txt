@@ -187,6 +187,11 @@ if(WITH_BLUESTORE)
   endif()
 endif()
 
+option(WITH_HSESTORE "HseStore OSD backend" ON)
+if(WITH_HSESTORE)
+  find_package(hse)
+endif()
+
 include(CMakeDependentOption)
 CMAKE_DEPENDENT_OPTION(WITH_LIBURING "Build with liburing library support" OFF
   "WITH_BLUESTORE;HAVE_LIBAIO" OFF)
@@ -245,7 +250,7 @@ if(WITH_KRBD AND NOT WITH_RBD)
 endif()
 if(LINUX)
   if(WITH_LIBCEPHFS OR WITH_KRBD)
-    # keyutils is only used when talking to the Linux Kernel key store 
+    # keyutils is only used when talking to the Linux Kernel key store
     find_package(keyutils REQUIRED)
     set(HAVE_KEYUTILS ${KEYUTILS_FOUND})
   endif()
@@ -492,7 +497,7 @@ option(PG_DEBUG_REFS "PG Ref debugging is enabled" OFF)
 
 option(WITH_TESTS "enable the build of ceph-test package scripts/binaries" ON)
 set(UNIT_TESTS_BUILT ${WITH_TESTS})
-set(CEPH_TEST_TIMEOUT 3600 CACHE STRING 
+set(CEPH_TEST_TIMEOUT 3600 CACHE STRING
   "Maximum time before a CTest gets killed" )
 
 # fio

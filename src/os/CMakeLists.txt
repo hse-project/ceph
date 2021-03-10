@@ -75,12 +75,18 @@ if(WITH_SPDK)
     bluestore/NVMEDevice.cc)
 endif()
 
+if(WITH_HSESTORE)
+  list(APPEND libos_srcs
+    hsestore/HseStore.cc
+  )
+endif()
+
 add_library(os STATIC ${libos_srcs})
 
 target_link_libraries(os heap_profiler kv)
 
 if(WITH_BLUEFS)
-  add_library(bluefs SHARED 
+  add_library(bluefs SHARED
     bluestore/BlueRocksEnv.cc)
   target_include_directories(bluefs SYSTEM PUBLIC
     $<TARGET_PROPERTY:RocksDB::RocksDB,INTERFACE_INCLUDE_DIRECTORIES>)
@@ -115,6 +121,10 @@ target_link_libraries(os kv)
 add_dependencies(os compressor_plugins)
 add_dependencies(os crypto_plugins)
 
+if(WITH_HSESTORE)
+  target_include_directories(os PRIVATE ${HSE_INCLUDE_DIR})
+  target_link_libraries(os ${HSE_LIBRARIES})
+endif()
 
 if(WITH_BLUESTORE)
   add_executable(ceph-bluestore-tool

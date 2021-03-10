@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -7,9 +7,9 @@
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software 
+ * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- * 
+ *
  */
 #include <ctype.h>
 #include <sstream>
@@ -26,6 +26,9 @@
 #endif
 #ifndef WITH_SEASTAR
 #include "kstore/KStore.h"
+#endif
+#if defined(WITH_HSESTORE)
+#include "hsestore/HseStore.h"
 #endif
 
 ObjectStore *ObjectStore::create(CephContext *cct,
@@ -66,6 +69,12 @@ ObjectStore *ObjectStore::create(CephContext *cct,
   if (type == "kstore" &&
       cct->check_experimental_feature_enabled("kstore")) {
     return new KStore(cct, data);
+  }
+#endif
+#if defined(WITH_HSESTORE)
+  if (type == "hsestore") {
+    // HSE_TODO: Do we need flags arg?
+    return new HseStore(cct, data);
   }
 #endif
   return NULL;
