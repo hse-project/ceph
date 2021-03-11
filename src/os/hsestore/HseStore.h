@@ -29,8 +29,10 @@
 #include "os/ObjectStore.h"
 #include "os/ObjectMap.h"
 #include "os/Transaction.h"
+#include "include/uuid.h"
 
 class HseStore : public ObjectStore {
+  using hse_oid_t = uint64_t;
 public:
   HseStore(CephContext *cct, const std::string &path)
     : ObjectStore(cct, path) {}
@@ -219,7 +221,14 @@ public:
   uint64_t estimate_objects_overhead(uint64_t num_objects) {
     return 64;
   }
+
 private:
+  struct hse_kvdb *kvdb;
+  struct hse_kvs *ceph_metadata_kvs;
+  struct hse_kvs *collection_object_kvs;
+  struct hse_kvs *object_data_kvs;
+  struct hse_kvs *object_xattr_kvs;
+  struct hse_kvs *object_omap_kvs;
 };
 
 #endif
