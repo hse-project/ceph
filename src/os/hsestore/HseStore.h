@@ -23,6 +23,8 @@
 #include <vector>
 #include <optional>
 #include <hse/hse.h>
+#include <hse/hse_limits.h>
+#include <string_view>
 
 #include "common/TrackedOp.h"
 #include "osd/osd_types.h"
@@ -35,7 +37,8 @@ class HseStore : public ObjectStore {
   using hse_oid_t = uint64_t;
 public:
   HseStore(CephContext *cct, const std::string &path)
-    : ObjectStore(cct, path) {}
+    : ObjectStore(cct, path)
+    , kvdb_name(cct->_conf->hsestore_kvdb) {}
   ~HseStore() override;
 
   std::string get_type() override {
@@ -57,17 +60,11 @@ public:
   }
 
   bool test_mount_in_use() override {
-    return false;
+    return kvdb != nullptr;
   }
-  int mount() override {
-    return -EOPNOTSUPP;
-  }
-  int umount() override{
-    return -EOPNOTSUPP;
-  }
-  int fsck(bool deep) override {
-    return -EOPNOTSUPP;
-  }
+  int mount() override;
+  int umount() override;
+
   int validate_hobject_key(const hobject_t &obj) const override {
     return 0;
   }
@@ -75,9 +72,9 @@ public:
     // HSE_TODO: random
     return 256;
   }
-  int mkfs() override {
-    return -EOPNOTSUPP;
-  }
+
+  int mkfs() override;
+
   int mkjournal() override {
     return 0;
   }
@@ -223,6 +220,8 @@ public:
   }
 
 private:
+  std::string_view kvdb_name;
+
   struct hse_kvdb *kvdb;
   struct hse_kvs *ceph_metadata_kvs;
   struct hse_kvs *collection_object_kvs;
