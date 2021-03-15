@@ -85,31 +85,37 @@ int HseStore::umount()
   if (rc) {
     goto err_out;
   }
+  ceph_metadata_kvs = nullptr;
 
   rc = hse_kvdb_kvs_close(collection_object_kvs);
   if (rc) {
     goto err_out;
   }
+  collection_object_kvs = nullptr;
 
   rc = hse_kvdb_kvs_close(object_data_kvs);
   if (rc) {
     goto err_out;
   }
+  object_data_kvs = nullptr;
 
   rc = hse_kvdb_kvs_close(object_xattr_kvs);
   if (rc) {
     goto err_out;
   }
+  object_xattr_kvs = nullptr;
 
   rc = hse_kvdb_kvs_close(object_omap_kvs);
   if (rc) {
     goto err_out;
   }
+  object_omap_kvs = nullptr;
 
   rc = hse_kvdb_close(kvdb);
   if (rc) {
     goto err_out;
   }
+  kvdb = nullptr;
 
 err_out:
   hse_kvdb_fini();
