@@ -87,8 +87,8 @@ class WaitCondTs : WaitCond {
 
 //
 // Serialize transaction processing for a same collection.
-// It is achieved by serializing the threads calling queue_transactions() on a same 
-// collection. 
+// It is achieved by serializing the threads calling queue_transactions() on a same
+// collection.
 // These threads run one by one in the order they entered queue_transactions().
 // There is one instance of this class per collection.
 //
@@ -133,24 +133,24 @@ class HseStore : public ObjectStore {
 
   class Collection : public ObjectStore::CollectionImpl {
 	HseStore *_store;
-	Syncer *_syncer;	
+	Syncer *_syncer;
 	TransactionSerialization _ts;
 
-	// The transactions are assigned a sequence number when they are queued. 
+	// The transactions are assigned a sequence number when they are queued.
 	// There is one/distinct sequence per collection.
 	// This sequence number increments each time a transaction is queued.
-	// Because transactions are serialized per collection, "latest" sequence 
+	// Because transactions are serialized per collection, "latest" sequence
 	// number also mean "highest" sequence number.
 
 	// sqn for next txn to be queued.
 	uint64_t _t_seq_next;
 
 	// txns up to _t_seq_committed_sync are waiting to be synced/persisted
-	// When a sync starts, the sync thread copies _t_seq_committed_latest into 
+	// When a sync starts, the sync thread copies _t_seq_committed_latest into
 	// _t_seq_committed_wait_sync
 	uint64_t _t_seq_committed_wait_sync;
 
-	// txns up to _t_seq_persisted_latest have been synced/persisted 
+	// txns up to _t_seq_persisted_latest have been synced/persisted
 	uint64_t _t_seq_persisted_latest;
 
 	void flush() override;
@@ -163,7 +163,7 @@ class HseStore : public ObjectStore {
 	list <TxnWaitPersist *> _committed_wait_persist;
 
 
-	// Add a committed transaction (hse_kvdb_txn_commit() returned) in the list of 
+	// Add a committed transaction (hse_kvdb_txn_commit() returned) in the list of
 	// transaction waiting to be persisted.
 	void queue_wait_persist(Context *ctx, uint64_t t_seq);
 
@@ -192,7 +192,7 @@ class HseStore : public ObjectStore {
 
   ceph::unordered_map<coll_t, CollectionRef> coll_map;
   map<coll_t,CollectionRef> new_coll_map;
-  
+
   //
   // Ceph Finisher worker thread used to call the Ceph callbacks (Context).
   //
@@ -410,12 +410,12 @@ class Syncer {
   boost::thread_group _worker_threads;
 
   // Function called when flush_commit() is called
-  static void do_sync(HseStore::Collection *c, Context *ctx, 
+  static void do_sync(HseStore::Collection *c, Context *ctx,
   		uint64_t t_seq_committed_at_flush);
 
 
   public:
-  void post_sync(HseStore::Collection *c, Context *ctx, 
+  void post_sync(HseStore::Collection *c, Context *ctx,
   		uint64_t t_seq_committed_latest) {
     _sync_wq.post(boost::bind(do_sync, c, ctx, t_seq_committed_latest));
 

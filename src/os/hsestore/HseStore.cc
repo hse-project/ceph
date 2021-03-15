@@ -95,7 +95,7 @@ bool HseStore::Collection::flush_commit(Context *ctx)
   // Queue the sync request to the syncer thread
   _syncer->post_sync(this, ctx, _t_seq_next - 1);
 
-  return false;	
+  return false;
 }
 
 void HseStore::Collection::queue_wait_persist(Context *ctx, uint64_t t_seq) {
@@ -113,19 +113,19 @@ void HseStore::Collection::committed_wait_persist_cb(HseStore::Collection *c)
   auto it = c->_committed_wait_persist.begin();
   while (it != c->_committed_wait_persist.end()) {
     TxnWaitPersist *twp = *it;
-    
+
     // Stop at the first transaction not yet persisted.
     if (twp->_t_seq > c->_t_seq_persisted_latest)
     break;
-    
+
     c->_committed_wait_persist.pop_front();
     lock.unlock();
-    
+
     // Invoke the Ceph "commit" callback.
     c->_store->finisher.queue(twp->_persist_ctx);
-    
+
     delete twp;
-    
+
     lock.lock();
     it = c->_committed_wait_persist.begin();
   }
@@ -144,7 +144,7 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
     // We have to sync
     //
     HseStore::Collection *c1;
-  
+
     // Record for each collection, the latest committed before starting the sync.
     boost::shared_lock l{c->_store->coll_lock};
     for (auto const& [key, val] : c->_store->coll_map) {
@@ -152,7 +152,7 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
   		c1->_t_seq_committed_wait_sync = c1->_t_seq_next - 1;
     }
     l.unlock();
-  	
+
     // hse_sync()
 
     // Record the latest transaction persisted.
@@ -160,14 +160,14 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
     for (auto const& [key, val] : c->_store->coll_map) {
       c1 = static_cast<HseStore::Collection*>(val.get());
       c1->_t_seq_persisted_latest = c1->_t_seq_committed_wait_sync;
-      
-      // Invoke the Ceph "commit" callback for all the transactions that had 
+
+      // Invoke the Ceph "commit" callback for all the transactions that had
       // been committed  and are now persisted.
       HseStore::Collection::committed_wait_persist_cb(c1);
     }
     l.unlock();
   }
-  
+
   c->_store->finisher.queue(ctx);
 }
 
@@ -222,7 +222,7 @@ int HseStore::remove_collection(coll_t cid, CollectionRef *c)
 {
   ceph_abort_msg("not supported");
   return 0;
-} 
+}
 int HseStore::create_collection(coll_t cid, unsigned bits, CollectionRef *c)
 {
   ceph_abort_msg("not supported");
@@ -250,7 +250,7 @@ int HseStore::queue_transactions(
 
   //
   // Block if a thread is already processing transactions on this collection.
-  // The WaitCondTs destructor will wakeup the next queue_transactions() thread 
+  // The WaitCondTs destructor will wakeup the next queue_transactions() thread
   // waiting to run on the collection.
   //
   WaitCondTs ts(&(c->_ts));
@@ -270,7 +270,7 @@ int HseStore::queue_transactions(
     contexts = t.get_on_applied();
     if (contexts)
       finisher.queue(contexts);
-  
+
     //
     // Queue the transaction till persisted.
     // The "commit" Ceph callback will be invoked later when the transaction
@@ -279,7 +279,7 @@ int HseStore::queue_transactions(
     c->queue_wait_persist(t.get_on_commit(), c->_t_seq_next++);
   }
 
-  // The WaitCondTs destructor (variable ts) will wakeup the next queue_transactions() 
+  // The WaitCondTs destructor (variable ts) will wakeup the next queue_transactions()
   // thread waiting to run on the collection.
   return 0;
 }
