@@ -27,7 +27,7 @@
 WaitCondTs::WaitCondTs(TransactionSerialization *ts)
 {
   this->_ts = ts;
-  std::unique_lock lock(ts->_ts_mutex);
+  boost::unique_lock lock(ts->_ts_mutex);
   if (ts->_ts_th_running) {
     ts->_ts_th_waiting.push_back(this);
     lock.unlock();
@@ -48,7 +48,7 @@ WaitCondTs::~WaitCondTs()
 {
   ceph_assert(_ts->_ts_th_running);
 
-  std::unique_lock lock(_ts->_ts_mutex);
+  boost::unique_lock lock(_ts->_ts_mutex);
 
   if (_ts->_ts_th_waiting.empty()) {
     // No thread is queued waiting to run
@@ -101,14 +101,14 @@ bool HseStore::Collection::flush_commit(Context *ctx)
 void HseStore::Collection::queue_wait_persist(Context *ctx, uint64_t t_seq) {
 	TxnWaitPersist *twp = new TxnWaitPersist(ctx, t_seq);
 
-  std::unique_lock lock(_committed_wait_persist_mtx);
+  boost::unique_lock lock(_committed_wait_persist_mtx);
   _committed_wait_persist.push_back(twp);
 }
 
 void HseStore::Collection::committed_wait_persist_cb(HseStore::Collection *c)
 {
 
-  std::unique_lock lock(c->_committed_wait_persist_mtx);
+  boost::unique_lock lock(c->_committed_wait_persist_mtx);
 
   auto it = c->_committed_wait_persist.begin();
   while (it != c->_committed_wait_persist.end()) {
@@ -146,10 +146,9 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
     HseStore::Collection *c1;
   
     // Record for each collection, the latest committed before starting the sync.
-    std::shared_lock l{c->_store->coll_lock};
-    for (auto p = c->_store->coll_map.begin(); p != c->_store->coll_map.end(); ++p) {
-
-  		c1 = static_cast<HseStore::Collection*>(p->second.get());
+    boost::shared_lock l{c->_store->coll_lock};
+    for (auto const& [key, val] : c->_store->coll_map) {
+  		c1 = static_cast<HseStore::Collection*>(val.get());
   		c1->_t_seq_committed_wait_sync = c1->_t_seq_next - 1;
     }
     l.unlock();
@@ -158,9 +157,8 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
 
     // Record the latest transaction persisted.
     l.lock();
-    for (auto p = c->_store->coll_map.begin(); p != c->_store->coll_map.end(); ++p) {
-
-      c1 = static_cast<HseStore::Collection*>(p->second.get());
+    for (auto const& [key, val] : c->_store->coll_map) {
+      c1 = static_cast<HseStore::Collection*>(val.get());
       c1->_t_seq_persisted_latest = c1->_t_seq_committed_wait_sync;
       
       // Invoke the Ceph "commit" callback for all the transactions that had 
@@ -192,30 +190,29 @@ ObjectStore::CollectionHandle HseStore::create_new_collection(const coll_t& cid)
 {
   auto c = ceph::make_ref<HseStore::Collection>(this, cid);
 
-  std::unique_lock l{coll_lock};
+  boost::unique_lock l{coll_lock};
   new_coll_map[cid] = c;
   return c;
 }
 
 int HseStore::list_collections(vector<coll_t>& ls)
 {
-  std::shared_lock l{coll_lock};
+  boost::shared_lock l{coll_lock};
 
-  for (ceph::unordered_map<coll_t, CollectionRef>::iterator p = coll_map.begin();
-       p != coll_map.end(); ++p)
-    ls.push_back(p->first);
+  for (auto const& [key, val] : coll_map)
+    ls.push_back(key);
   return 0;
 }
 
 bool HseStore::collection_exists(const coll_t& c)
 {
-  std::shared_lock l{coll_lock};
+  boost::shared_lock l{coll_lock};
   return coll_map.count(c);
 }
 
 HseStore::CollectionRef HseStore::get_collection(coll_t cid)
 {
-  std::shared_lock l{coll_lock};
+  boost::shared_lock l{coll_lock};
   ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
   if (cp == coll_map.end())
     return CollectionRef();
@@ -258,19 +255,19 @@ int HseStore::queue_transactions(
   //
   WaitCondTs ts(&(c->_ts));
 
-  for (vector<Transaction>::iterator p = tls.begin(); p != tls.end(); ++p) {
+  for (auto t : tls) {
     Context *contexts;
 
-    start_one_transaction(c, &(*p));
+    start_one_transaction(c, &t);
 
     //
     // Invoke the two Ceph apply callbacks.
     //
-    contexts = (*p).get_on_applied_sync();
+    contexts = t.get_on_applied_sync();
     if (contexts)
       contexts->complete(0);
 
-    contexts = (*p).get_on_applied();
+    contexts = t.get_on_applied();
     if (contexts)
       finisher.queue(contexts);
   
@@ -279,7 +276,7 @@ int HseStore::queue_transactions(
     // The "commit" Ceph callback will be invoked later when the transaction
     // is persisted by the syncer.
     //
-    c->queue_wait_persist((*p).get_on_commit(), c->_t_seq_next++);
+    c->queue_wait_persist(t.get_on_commit(), c->_t_seq_next++);
   }
 
   // The WaitCondTs destructor (variable ts) will wakeup the next queue_transactions() 
@@ -306,9 +303,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 
   vector<CollectionRef> cvec(i.colls.size());
   unsigned j = 0;
-  for (vector<coll_t>::iterator p = i.colls.begin(); p != i.colls.end();
-       ++p, ++j) {
-    cvec[j] = get_collection(*p);
+  for (auto c: i.colls) {
+    cvec[j++] = get_collection(c);
   }
 
   for (int pos = 0; i.have_op(); ++pos) {
