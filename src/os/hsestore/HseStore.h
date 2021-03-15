@@ -23,6 +23,8 @@
 #include <vector>
 #include <optional>
 #include <hse/hse.h>
+#include <hse/hse_limits.h>
+#include <string_view>
 
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/unordered_set.hpp>
@@ -44,45 +46,45 @@
 
 
 class WaitCond {
-	boost::condition_variable   _done_cond;
-	boost::mutex                _done_mutex;
-	uint64_t                    _val;
-	bool                        _done = false;
+  boost::condition_variable   _done_cond;
+  boost::mutex                _done_mutex;
+  uint64_t                    _val;
+  bool                        _done = false;
 
-  public:
-	void wait()
-	{
-		boost::unique_lock<boost::mutex> lock(_done_mutex);
-
-		while (!_done)
-		{
-    			_done_cond.wait(lock);
-		}
-	}
-	void wakeup()
-	{
-		boost::unique_lock<boost::mutex> lock(_done_mutex);
-
-		_done = true;
-		_done_cond.notify_one();
-	}
-	uint64_t get_val()
-	{
-		return _val;
-	}
-
-	WaitCond() : _val(0) {}
-	WaitCond(uint64_t val) : _val(val) {}
-
+public:
+  void wait()
+  {
+    boost::unique_lock<boost::mutex> lock(_done_mutex);
+  
+    while (!_done)
+    {
+      _done_cond.wait(lock);
+    }
+  }
+  void wakeup()
+  {
+    boost::unique_lock<boost::mutex> lock(_done_mutex);
+  
+    _done = true;
+    _done_cond.notify_one();
+  }
+  uint64_t get_val()
+  {
+    return _val;
+  }
+  
+  WaitCond() : _val(0) {}
+  WaitCond(uint64_t val) : _val(val) {}
+  
 };
 
 class TransactionSerialization;
 class WaitCondTs : WaitCond {
-	TransactionSerialization *_ts;
-
-	public:
-		WaitCondTs(TransactionSerialization *ts);
-		~WaitCondTs();
+  TransactionSerialization *_ts;
+  
+public:
+  WaitCondTs(TransactionSerialization *ts);
+  ~WaitCondTs();
 };
 
 //
@@ -94,19 +96,19 @@ class WaitCondTs : WaitCond {
 //
 class TransactionSerialization {
 
-	// Mutex to protect members below.
-	boost::mutex _ts_mutex;
-
-	//
-	// List of threads waiting in (queue_transactions()) for their turn to
-	// process transactions on the collection.
-	//
-	list <WaitCondTs *> _ts_th_waiting;
-
-	// True is a thread is processing transaction[s] on this collection.
-	bool _ts_th_running = 0;
-
-	friend class WaitCondTs;
+  // Mutex to protect members below.
+  boost::mutex _ts_mutex;
+  
+  //
+  // List of threads waiting in (queue_transactions()) for their turn to
+  // process transactions on the collection.
+  //
+  list <WaitCondTs *> _ts_th_waiting;
+  
+  // True is a thread is processing transaction[s] on this collection.
+  bool _ts_th_running = 0;
+  
+  friend class WaitCondTs;
 };
 
 
@@ -132,52 +134,52 @@ class HseStore : public ObjectStore {
   Syncer *_syncer;
 
   class Collection : public ObjectStore::CollectionImpl {
-	HseStore *_store;
-	Syncer *_syncer;
-	TransactionSerialization _ts;
-
-	// The transactions are assigned a sequence number when they are queued.
-	// There is one/distinct sequence per collection.
-	// This sequence number increments each time a transaction is queued.
-	// Because transactions are serialized per collection, "latest" sequence
-	// number also mean "highest" sequence number.
-
-	// sqn for next txn to be queued.
-	uint64_t _t_seq_next;
-
-	// txns up to _t_seq_committed_sync are waiting to be synced/persisted
-	// When a sync starts, the sync thread copies _t_seq_committed_latest into
-	// _t_seq_committed_wait_sync
-	uint64_t _t_seq_committed_wait_sync;
-
-	// txns up to _t_seq_persisted_latest have been synced/persisted
-	uint64_t _t_seq_persisted_latest;
-
-	void flush() override;
-        bool flush_commit(Context *c) override;
-
-	//
-	// List of transactions committed and waiting to be persisted.
-	//
-	std::mutex _committed_wait_persist_mtx; // protect _committed_wait_persist
-	list <TxnWaitPersist *> _committed_wait_persist;
-
-
-	// Add a committed transaction (hse_kvdb_txn_commit() returned) in the list of
-	// transaction waiting to be persisted.
-	void queue_wait_persist(Context *ctx, uint64_t t_seq);
-
-	// Call the Ceph "commit" callback that needs to be called when a transaction is
-	// persisted. Does that for all transaction that were hse_kvdb_txn_commit()
-	// and have been persisted.
-	static void committed_wait_persist_cb(HseStore::Collection *c);
-
-	public:
-	// Constructor
-	Collection(HseStore *store, coll_t cid);
-
-  	friend class Syncer;
-  	friend class HseStore;
+    HseStore *_store;
+    Syncer *_syncer;
+    TransactionSerialization _ts;
+    
+    // The transactions are assigned a sequence number when they are queued.
+    // There is one/distinct sequence per collection.
+    // This sequence number increments each time a transaction is queued.
+    // Because transactions are serialized per collection, "latest" sequence
+    // number also mean "highest" sequence number.
+    
+    // sqn for next txn to be queued.
+    uint64_t _t_seq_next;
+    
+    // txns up to _t_seq_committed_sync are waiting to be synced/persisted
+    // When a sync starts, the sync thread copies _t_seq_committed_latest into
+    // _t_seq_committed_wait_sync
+    uint64_t _t_seq_committed_wait_sync;
+    
+    // txns up to _t_seq_persisted_latest have been synced/persisted
+    uint64_t _t_seq_persisted_latest;
+    
+    void flush() override;
+    bool flush_commit(Context *c) override;
+    
+    //
+    // List of transactions committed and waiting to be persisted.
+    //
+    std::mutex _committed_wait_persist_mtx; // protect _committed_wait_persist
+    list <TxnWaitPersist *> _committed_wait_persist;
+    
+    
+    // Add a committed transaction (hse_kvdb_txn_commit() returned) in the list of
+    // transaction waiting to be persisted.
+    void queue_wait_persist(Context *ctx, uint64_t t_seq);
+    
+    // Call the Ceph "commit" callback that needs to be called when a transaction is
+    // persisted. Does that for all transaction that were hse_kvdb_txn_commit()
+    // and have been persisted.
+    static void committed_wait_persist_cb(HseStore::Collection *c);
+    
+    public:
+    // Constructor
+    Collection(HseStore *store, coll_t cid);
+    
+    friend class Syncer;
+    friend class HseStore;
   };
   using CollectionRef = ceph::ref_t<Collection>;
 
@@ -226,17 +228,11 @@ public:
       ThreadPool::TPHandle *handle = NULL) override;
 
   bool test_mount_in_use() override {
-    return false;
+    return kvdb != nullptr;
   }
-  int mount() override {
-    return -EOPNOTSUPP;
-  }
-  int umount() override{
-    return -EOPNOTSUPP;
-  }
-  int fsck(bool deep) override {
-    return -EOPNOTSUPP;
-  }
+  int mount() override;
+  int umount() override;
+
   int validate_hobject_key(const hobject_t &obj) const override {
     return 0;
   }
@@ -244,9 +240,9 @@ public:
     // HSE_TODO: random
     return 256;
   }
-  int mkfs() override {
-    return -EOPNOTSUPP;
-  }
+
+  int mkfs() override;
+
   int mkjournal() override {
     return 0;
   }
@@ -311,7 +307,7 @@ public:
   }
 
   int getattr(CollectionHandle &c, const ghobject_t& oid,
-		  const char *name, ceph::buffer::ptr& value) override {
+    const char *name, ceph::buffer::ptr& value) override {
     return -EOPNOTSUPP;
   }
 
@@ -333,28 +329,28 @@ public:
   }
 
   int collection_list(CollectionHandle &c, const ghobject_t &start,
-      const ghobject_t &end, int max, std::vector<ghobject_t> *ls, ghobject_t *next) override {
+    const ghobject_t &end, int max, std::vector<ghobject_t> *ls, ghobject_t *next) override {
     return -EOPNOTSUPP;
   }
 
   int omap_get(CollectionHandle &c, const ghobject_t &oid, ceph::buffer::list *header,
-      std::map<std::string, ceph::buffer::list> *out) override {
+    std::map<std::string, ceph::buffer::list> *out) override {
     return -EOPNOTSUPP;
   }
 
   int omap_get_header(CollectionHandle &c, const ghobject_t &oid,
-      ceph::buffer::list *header, bool allow_eio = false) override {
+    ceph::buffer::list *header, bool allow_eio = false) override {
     return -EOPNOTSUPP;
   }
 
   int omap_get_keys(CollectionHandle &c, const ghobject_t &oid,
-      std::set<std::string> *keys) override {
+    std::set<std::string> *keys) override {
     return -EOPNOTSUPP;
   }
 
   int omap_get_values(CollectionHandle &c, const ghobject_t &oid,
-      const std::set<std::string> &keys,
-      std::map<std::string, ceph::buffer::list> *out) override {
+    const std::set<std::string> &keys,
+    std::map<std::string, ceph::buffer::list> *out) override {
     return -EOPNOTSUPP;
   }
 
@@ -385,6 +381,8 @@ public:
     return 64;
   }
 private:
+  std::string_view kvdb_name;
+
   struct hse_kvdb *kvdb;
   struct hse_kvs *ceph_metadata_kvs;
   struct hse_kvs *collection_object_kvs;
@@ -411,12 +409,12 @@ class Syncer {
 
   // Function called when flush_commit() is called
   static void do_sync(HseStore::Collection *c, Context *ctx,
-  		uint64_t t_seq_committed_at_flush);
+    uint64_t t_seq_committed_at_flush);
 
 
-  public:
+public:
   void post_sync(HseStore::Collection *c, Context *ctx,
-  		uint64_t t_seq_committed_latest) {
+    uint64_t t_seq_committed_latest) {
     _sync_wq.post(boost::bind(do_sync, c, ctx, t_seq_committed_latest));
 
   }

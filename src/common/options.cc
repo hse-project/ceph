@@ -3812,7 +3812,7 @@ std::vector<Option> get_global_options() {
 
     Option("osd_objectstore", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("bluestore")
-    .set_enum_allowed({"bluestore", "filestore", "memstore", "kstore"})
+    .set_enum_allowed({"bluestore", "filestore", "memstore", "kstore", "hsestore"})
     .set_flag(Option::FLAG_CREATE)
     .set_description("backend type for an OSD (like filestore or bluestore)"),
 
@@ -3977,11 +3977,11 @@ std::vector<Option> get_global_options() {
     Option("bdev_async_discard", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
     .set_description(""),
-    
+
     Option("bdev_flock_retry_interval", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0.1)
     .set_description("interval to retry the flock"),
-    
+
     Option("bdev_flock_retry", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(3)
     .set_description("times to retry the flock"),
@@ -5093,6 +5093,14 @@ std::vector<Option> get_global_options() {
     .set_default(false)
     .set_description(""),
 
+    // --------------------------
+    // hsestore
+
+    Option("hsestore_kvdb", Option::TYPE_STR, Option::LEVEL_BASIC)
+    .set_default("ceph")
+    .set_flag(Option::FLAG_CREATE)
+    .set_description("KVDB HseStore should use to store data"),
+
     Option("journal_dio", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(true)
     .set_description(""),
@@ -5560,7 +5568,7 @@ std::vector<Option> get_rgw_options() {
     .set_long_description(
         "This is needed for virtual hosting of buckets, unless configured via zonegroup "
         "configuration."),
-    
+
     Option("rgw_numa_node", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(-1)
     .set_flag(Option::FLAG_STARTUP)
@@ -8251,7 +8259,7 @@ std::vector<Option> get_mds_options() {
     .set_default(false)
     .set_flag(Option::FLAG_RUNTIME)
     .set_description("always process op on auth mds"),
-    
+
     Option("mds_damage_table_max_entries", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(10000)
     .set_description("maximum number of damage table entries"),
