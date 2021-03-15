@@ -55,7 +55,7 @@ public:
   void wait()
   {
     boost::unique_lock<boost::mutex> lock(_done_mutex);
-  
+
     while (!_done)
     {
       _done_cond.wait(lock);
@@ -64,7 +64,7 @@ public:
   void wakeup()
   {
     boost::unique_lock<boost::mutex> lock(_done_mutex);
-  
+
     _done = true;
     _done_cond.notify_one();
   }
@@ -72,16 +72,16 @@ public:
   {
     return _val;
   }
-  
+
   WaitCond() : _val(0) {}
   WaitCond(uint64_t val) : _val(val) {}
-  
+
 };
 
 class TransactionSerialization;
 class WaitCondTs : WaitCond {
   TransactionSerialization *_ts;
-  
+
 public:
   WaitCondTs(TransactionSerialization *ts);
   ~WaitCondTs();
@@ -98,16 +98,16 @@ class TransactionSerialization {
 
   // Mutex to protect members below.
   boost::mutex _ts_mutex;
-  
+
   //
   // List of threads waiting in (queue_transactions()) for their turn to
   // process transactions on the collection.
   //
   list <WaitCondTs *> _ts_th_waiting;
-  
+
   // True is a thread is processing transaction[s] on this collection.
   bool _ts_th_running = 0;
-  
+
   friend class WaitCondTs;
 };
 
@@ -130,54 +130,54 @@ class TxnWaitPersist {
 class Syncer;
 
 class HseStore : public ObjectStore {
-  using hse_iod_t = uint64_t;
+  using hse_oid_t = uint64_t;
   Syncer *_syncer;
 
   class Collection : public ObjectStore::CollectionImpl {
     HseStore *_store;
     Syncer *_syncer;
     TransactionSerialization _ts;
-    
+
     // The transactions are assigned a sequence number when they are queued.
     // There is one/distinct sequence per collection.
     // This sequence number increments each time a transaction is queued.
     // Because transactions are serialized per collection, "latest" sequence
     // number also mean "highest" sequence number.
-    
+
     // sqn for next txn to be queued.
     uint64_t _t_seq_next;
-    
+
     // txns up to _t_seq_committed_sync are waiting to be synced/persisted
     // When a sync starts, the sync thread copies _t_seq_committed_latest into
     // _t_seq_committed_wait_sync
     uint64_t _t_seq_committed_wait_sync;
-    
+
     // txns up to _t_seq_persisted_latest have been synced/persisted
     uint64_t _t_seq_persisted_latest;
-    
+
     void flush() override;
     bool flush_commit(Context *c) override;
-    
+
     //
     // List of transactions committed and waiting to be persisted.
     //
     std::mutex _committed_wait_persist_mtx; // protect _committed_wait_persist
     list <TxnWaitPersist *> _committed_wait_persist;
-    
-    
+
+
     // Add a committed transaction (hse_kvdb_txn_commit() returned) in the list of
     // transaction waiting to be persisted.
     void queue_wait_persist(Context *ctx, uint64_t t_seq);
-    
+
     // Call the Ceph "commit" callback that needs to be called when a transaction is
     // persisted. Does that for all transaction that were hse_kvdb_txn_commit()
     // and have been persisted.
     static void committed_wait_persist_cb(HseStore::Collection *c);
-    
+
     public:
     // Constructor
     Collection(HseStore *store, coll_t cid);
-    
+
     friend class Syncer;
     friend class HseStore;
   };
