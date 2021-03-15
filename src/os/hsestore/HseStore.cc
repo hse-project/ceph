@@ -12,6 +12,7 @@
  *
  */
 
+#include <string_view>
 #include <hse/hse.h>
 
 #include "HseStore.h"
@@ -21,11 +22,11 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "hsestore(" << path << ") "
 
-#define CEPH_METADATA_KVS_NAME "ceph-metadata"
-#define COLLECTION_OBJECT_KVS_NAME "collection-object"
-#define OBJECT_DATA_KVS_NAME "object-data"
-#define OBJECT_XATTR_KVS_NAME "object-xattr"
-#define OBJECT_OMAP_KVS_NAME "object-omap"
+static constexpr std::string_view CEPH_METADATA_KVS_NAME = "ceph-metadata";
+static constexpr std::string_view COLLECTION_OBJECT_KVS_NAME = "collection-object";
+static constexpr std::string_view OBJECT_DATA_KVS_NAME = "object-data";
+static constexpr std::string_view OBJECT_XATTR_KVS_NAME = "object-xattr";
+static constexpr std::string_view OBJECT_OMAP_KVS_NAME = "object-omap";
 
 HseStore::~HseStore()
 {
@@ -46,31 +47,30 @@ int HseStore::mount()
   }
 
   /* HSE_TODO: how to handle error logic here */
-  rc = hse_kvdb_kvs_open(kvdb, CEPH_METADATA_KVS_NAME, nullptr, &ceph_metadata_kvs);
+  rc = hse_kvdb_kvs_open(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr, &ceph_metadata_kvs);
   if (rc) {
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, COLLECTION_OBJECT_KVS_NAME, nullptr, &collection_object_kvs);
+  rc = hse_kvdb_kvs_open(kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr, &collection_object_kvs);
   if (rc) {
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, OBJECT_DATA_KVS_NAME, nullptr, &object_data_kvs);
+  rc = hse_kvdb_kvs_open(kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr, &object_data_kvs);
   if (rc) {
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, OBJECT_XATTR_KVS_NAME, nullptr, &object_xattr_kvs);
+  rc = hse_kvdb_kvs_open(kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr, &object_xattr_kvs);
   if (rc) {
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, OBJECT_OMAP_KVS_NAME, nullptr, &object_omap_kvs);
+  rc = hse_kvdb_kvs_open(kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr, &object_omap_kvs);
   if (rc) {
     goto err_out;
   }
-
 
 err_out:
   return rc ? -hse_err_to_errno(rc) : 0;
@@ -137,27 +137,27 @@ int HseStore::mkfs()
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, CEPH_METADATA_KVS_NAME, nullptr);
+  rc = hse_kvdb_kvs_make(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr);
   if (rc) {
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, COLLECTION_OBJECT_KVS_NAME, nullptr);
+  rc = hse_kvdb_kvs_make(kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr);
   if (rc) {
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, OBJECT_DATA_KVS_NAME, nullptr);
+  rc = hse_kvdb_kvs_make(kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr);
   if (rc) {
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, OBJECT_XATTR_KVS_NAME, nullptr);
+  rc = hse_kvdb_kvs_make(kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr);
   if (rc) {
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, OBJECT_OMAP_KVS_NAME, nullptr);
+  rc = hse_kvdb_kvs_make(kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr);
   if (rc) {
     goto kvdb_out;
   }
