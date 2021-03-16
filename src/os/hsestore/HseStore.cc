@@ -17,6 +17,7 @@
 
 #include "common/debug.h"
 #include "HseStore.h"
+#include "os/kv.h"
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_hsestore
@@ -189,7 +190,7 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
 
 
 HseStore::HseStore(CephContext *cct, const string& path)
-  : ObjectStore(cct, path), 
+  : ObjectStore(cct, path),
     finisher(cct),
     kvdb_name(cct->_conf->hsestore_kvdb)
 {
@@ -575,9 +576,9 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     if (!o) {
       // these operations implicity create the object
       bool create = false;
-      if (op->op == Transaction::OP_TOUCH ||
-	  op->op == Transaction::OP_CREATE ||
-	  op->op == Transaction::OP_WRITE ||
+      if (op->op == Transaction::OP_TOUCH
+	  op->op == Transaction::OP_CREATE
+	  op->op == Transaction::OP_WRITE
 	  op->op == Transaction::OP_ZERO) {
 	create = true;
       }
@@ -779,9 +780,9 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     if (r < 0) {
       bool ok = false;
 
-      if (r == -ENOENT && !(op->op == Transaction::OP_CLONERANGE ||
-			    op->op == Transaction::OP_CLONE ||
-			    op->op == Transaction::OP_CLONERANGE2 ||
+      if (r == -ENOENT && !(op->op == Transaction::OP_CLONERANGE
+			    op->op == Transaction::OP_CLONE
+			    op->op == Transaction::OP_CLONERANGE2
 			    op->op == Transaction::OP_COLL_ADD))
 	// -ENOENT is usually okay
 	ok = true;
@@ -791,8 +792,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       if (!ok) {
 	const char *msg = "unexpected error code";
 
-	if (r == -ENOENT && (op->op == Transaction::OP_CLONERANGE ||
-			     op->op == Transaction::OP_CLONE ||
+	if (r == -ENOENT && (op->op == Transaction::OP_CLONERANGE
+			     op->op == Transaction::OP_CLONE
 			     op->op == Transaction::OP_CLONERANGE2))
 	  msg = "ENOENT on clone suggests osd bug";
 
@@ -826,4 +827,292 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
   //
 
   // hse_kvdb_txn_commit()
+}
+
+
+
+inline unsigned h2i(uint8_t c)
+{
+  if ((c >= '0') && (c <= '9')) {
+    return c - 0x30;
+  } else if ((c >= 'a') && (c <= 'f')) {
+    return c - 'a' + 10;
+  } else if ((c >= 'A') && (c <= 'F')) {
+    return c - 'A' + 10;
+  } else {
+    return 256; // make it always larger than 255
+  }
+}
+
+template<typename T>
+static void _key_encode_shard(shard_id_t shard, T *key)
+{
+  key->push_back((char)((uint8_t)shard.id + (uint8_t)0x80));
+}
+
+static const char *_key_decode_shard(const char *key, shard_id_t *pshard)
+{
+  pshard->id = (uint8_t)*key - (uint8_t)0x80;
+  return key + 1;
+}
+
+/*
+ * Used by get_object_key() to encode the strings from ghobject_t into the key
+ * that is the get_object_key() output.
+ *
+ * The key string needs to lexicographically sort the same way that
+ * ghobject_t does.  We do this by escaping anything <= to '#' with #
+ * plus a 2 digit hex string, and anything >= '~' with ~ plus the two
+ * hex digits.
+ *
+ * We use ! as a terminator for strings; this works because it is < #
+ * and will get escaped if it is present in the string.
+ *
+ * The bug deescribed below present in KStore and BlueStore implementation is fixed.
+ *   Bug: due to implicit character type conversion in comparison it may produce
+ *   unexpected ordering.
+ */
+template<typename S>
+static void append_escaped(const string &in, S *out)
+{
+  uint8_t hexbyte[in.length() * 3 + 1];
+  uint8_t* ptr = &hexbyte[0];
+  for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
+    uint8_t u = *i; // Fix the bug in BlueStore and KStore.
+
+    if (u <= '#') {
+      *ptr++ = '#';
+      *ptr++ = "0123456789abcdef"[(u >> 4) & 0x0f];
+      *ptr++ = "0123456789abcdef"[u & 0x0f];
+    } else if (u >= '~') {
+      *ptr++ = '~';
+      *ptr++ = "0123456789abcdef"[(u >> 4) & 0x0f];
+      *ptr++ = "0123456789abcdef"[u & 0x0f];
+    } else {
+      *ptr++  = u;
+    }
+  }
+  *ptr++ = '!';
+  out->append(hexbyte, ptr - &hexbyte[0]);
+}
+
+static int decode_escaped(const uint8_t *p, string *out)
+{
+  uint8_t buff[256];
+  uint8_t* ptr = &buff[0];
+  uint8_t* max = &buff[252];
+  const uint8_t *orig_p = p;
+  while (*p && *p != '!') {
+    if (*p == '#' || *p == '~') {
+      unsigned hex = 0;
+      p++;
+      hex = h2i(*p++) << 4;
+      if (hex > 255) {
+        return -EINVAL;
+      }
+      hex |= h2i(*p++);
+      if (hex > 255) {
+        return -EINVAL;
+      }
+      *ptr++ = hex;
+    } else {
+      *ptr++ = *p++;
+    }
+    if (ptr > max) {
+       out->append((char *)buff, (char *)(ptr-buff));
+       ptr = &buff[0];
+    }
+  }
+  if (ptr != buff) {
+     out->append((char *)buff, (char *)(ptr-buff));
+  }
+  return p - orig_p;
+}
+
+#define ENCODED_KEY_PREFIX_LEN (1 + 8 + 4)
+
+#undef dout_prefix
+#define dout_prefix *_dout << "hsestore "
+
+/*
+ * Convert a ghobject_t into a string that can be used in a hse key.
+ * This string may contain non printable characters.
+ * Based on Bluestore implementation.
+ *
+ * encoded u8: shard + 2^7 (so that it sorts properly)
+ * encoded u64: poolid + 2^63 (so that it sorts properly)
+ * encoded u32: hash (bit reversed)
+ *
+ * escaped string: namespace
+ *
+ * escaped string: key or object name
+ * 1 char: '<', '=', or '>'.  if =, then object key == object name, and
+ *         we are done.  otherwise, we are followed by the object name.
+ * escaped string: object name (unless '=' above)
+ *
+ * encoded u64: snap
+ * encoded u64: generation
+ */
+template<typename S>
+static void get_object_key(CephContext *cct, const ghobject_t& oid, S *key)
+{
+  key->clear();
+
+  size_t max_len = ENCODED_KEY_PREFIX_LEN +
+                  (oid.hobj.nspace.length() * 3 + 1) +
+                  (oid.hobj.get_key().length() * 3 + 1) +
+                   1 + // for '<', '=', or '>'
+                  (oid.hobj.oid.name.length() * 3 + 1) +
+                   8 + 8;
+  key->reserve(max_len);
+
+  //
+  // shard_id.
+  // One byte signed. The value is positive or is -1 (aka NO_SHARD).
+  // Encoded u8: shard + 2^7 (so that it sorts properly).
+  //
+  _key_encode_shard(oid.shard_id, key);
+
+  //
+  // pool
+  // Encoded u64: poolid + 2^63 (so that it sorts properly)
+  //
+  _key_encode_u64(oid.hobj.pool + 0x8000000000000000ull, key);
+
+  //
+  // hash
+  // Encoded u32: hash (bit reversed)
+  //
+  _key_encode_u32(oid.hobj.get_bitwise_key_u32(), key);
+
+  // Namespace
+  append_escaped(oid.hobj.nspace, key);
+
+
+  if (oid.hobj.get_key().length()) {
+    // is a key... could be < = or >.
+    append_escaped(oid.hobj.get_key(), key);
+    // (ASCII chars < = and > sort in that order, yay)
+    int r = oid.hobj.get_key().compare(oid.hobj.oid.name);
+    if (r) {
+      key->append(r > 0 ? ">" : "<");
+      append_escaped(oid.hobj.oid.name, key);
+    } else {
+      // same as no key
+      key->append("=");
+    }
+  } else {
+    // no key
+    append_escaped(oid.hobj.oid.name, key);
+    key->append("=");
+  }
+
+  _key_encode_u64(oid.hobj.snap, key);
+  _key_encode_u64(oid.generation, key);
+
+  // sanity check
+  if (true) {
+    ghobject_t t;
+    int r = get_key_object(*key, &t);
+    if (r || t != oid) {
+      derr << "  r " << r << dendl;
+      derr << "key " << pretty_binary_string(*key) << dendl;
+      derr << "oid " << oid << dendl;
+      derr << "  t " << t << dendl;
+      ceph_assert(t == oid);
+    }
+  }
+}
+
+/*
+ * Reverse of get_object_key().
+ * Based on Bluestore implementation.
+ */
+template<typename S>
+static int get_key_object(const S& key, ghobject_t *oid)
+{
+  int r;
+  uint64_t pool;
+  unsigned hash;
+  string k;
+  const char *p = key.c_str();
+
+  if (key.length() < ENCODED_KEY_PREFIX_LEN)
+    return -1;
+
+  p = _key_decode_shard(p, &oid->shard_id);
+
+  p = _key_decode_u64(p, &pool);
+  oid->hobj.pool = pool - 0x8000000000000000ull;
+
+  p = _key_decode_u32(p, &hash);
+
+  oid->hobj.set_bitwise_key_u32(hash);
+
+  if (key.length() == ENCODED_KEY_PREFIX_LEN)
+    return -2;
+
+  r = decode_escaped(p, &oid->hobj.nspace);
+  if (r < 0)
+    return -2;
+  p += r + 1;
+
+  r = decode_escaped(p, &k);
+  if (r < 0)
+    return -3;
+  p += r + 1;
+  if (*p == '=') {
+    // no key
+    ++p;
+    oid->hobj.oid.name = k;
+  } else if (*p == '<' || *p == '>') {
+    // key + name
+    ++p;
+    r = decode_escaped(p, &oid->hobj.oid.name);
+    if (r < 0)
+      return -5;
+    p += r + 1;
+    oid->hobj.set_key(k);
+  } else {
+    // malformed
+    return -6;
+  }
+
+  p = _key_decode_u64(p, &oid->hobj.snap.val);
+  p = _key_decode_u64(p, &oid->generation);
+
+  if (*p) {
+    // if we get something other than a null terminator here,
+    // something goes wrong.
+    return -8;
+  }
+
+  return 0;
+}
+
+/*
+ * Convert a coll_t into a 10 bytes "key"
+ */
+template<typename S>
+static void get_coll_key(CephContext *cct, const coll_t& coll, S *key)
+{
+  spg_t pgid;
+
+  key->clear();
+
+  if (coll.is_pg_prefix(&pgid)) {
+    if (coll.is_pg()) {
+      key->append("G");
+    } else {
+      key->append("T");
+    }
+    // 8+4+1 bytes below
+    _key_encode_u64(pgid.pgid.m_pool, key);
+    _key_encode_u32(pgid.pgid.m_seed, key);
+    _key_encode_shard(pgid.shard, key);
+  } else {
+    // Metadata collection
+    // 10 bytes
+    key->append("M123456789");
+  }
 }
