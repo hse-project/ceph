@@ -576,9 +576,9 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     if (!o) {
       // these operations implicity create the object
       bool create = false;
-      if (op->op == Transaction::OP_TOUCH
-	  op->op == Transaction::OP_CREATE
-	  op->op == Transaction::OP_WRITE
+      if (op->op == Transaction::OP_TOUCH ||
+	  op->op == Transaction::OP_CREATE ||
+	  op->op == Transaction::OP_WRITE ||
 	  op->op == Transaction::OP_ZERO) {
 	create = true;
       }
@@ -780,9 +780,9 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     if (r < 0) {
       bool ok = false;
 
-      if (r == -ENOENT && !(op->op == Transaction::OP_CLONERANGE
-			    op->op == Transaction::OP_CLONE
-			    op->op == Transaction::OP_CLONERANGE2
+      if (r == -ENOENT && !(op->op == Transaction::OP_CLONERANGE ||
+			    op->op == Transaction::OP_CLONE ||
+			    op->op == Transaction::OP_CLONERANGE2 ||
 			    op->op == Transaction::OP_COLL_ADD))
 	// -ENOENT is usually okay
 	ok = true;
@@ -792,8 +792,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       if (!ok) {
 	const char *msg = "unexpected error code";
 
-	if (r == -ENOENT && (op->op == Transaction::OP_CLONERANGE
-			     op->op == Transaction::OP_CLONE
+	if (r == -ENOENT && (op->op == Transaction::OP_CLONERANGE ||
+			     op->op == Transaction::OP_CLONE ||
 			     op->op == Transaction::OP_CLONERANGE2))
 	  msg = "ENOENT on clone suggests osd bug";
 
