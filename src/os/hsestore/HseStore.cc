@@ -913,8 +913,8 @@ static const char *_key_decode_shard(const char *key, shard_id_t *pshard)
 }
 
 /*
- * Used by get_object_key() to encode the strings from ghobject_t into the key
- * that is the get_object_key() output.
+ * Used by ghobject_t2key() to encode the strings from ghobject_t into the key
+ * that is the ghobject_t2key() output.
  *
  * The key string needs to lexicographically sort the same way that
  * ghobject_t does.  We do this by escaping anything <= to '#' with #
@@ -988,12 +988,12 @@ static int decode_escaped(const char *p, string *out)
 
 #undef dout_prefix
 #define dout_prefix *_dout << "hsestore "
-static int get_key_object(const string& key, ghobject_t *oid);
+static int key2ghobject_t(const string& key, ghobject_t *oid);
 
 /*
  * Convert a ghobject_t into a string that can be used in a hse key.
  * This string may contain non printable characters.
- * Based on Bluestore implementation.
+ * Based on Bluestore implementation (get_object_key()).
  *
  * encoded u8: shard + 2^7 (so that it sorts properly)
  * encoded u64: poolid + 2^63 (so that it sorts properly)
@@ -1009,7 +1009,7 @@ static int get_key_object(const string& key, ghobject_t *oid);
  * encoded u64: snap
  * encoded u64: generation
  */
-void get_object_key(CephContext *cct, const ghobject_t& oid, string *key)
+void ghobject_t2key(CephContext *cct, const ghobject_t& oid, string *key)
 {
   key->clear();
 
@@ -1068,7 +1068,7 @@ void get_object_key(CephContext *cct, const ghobject_t& oid, string *key)
   // sanity check
   if (true) {
     ghobject_t t;
-    int r = get_key_object(*key, &t);
+    int r = key2ghobject_t(*key, &t);
     if (r || t != oid) {
       derr << "  r " << r << dendl;
       derr << "key " << pretty_binary_string(*key) << dendl;
@@ -1080,10 +1080,10 @@ void get_object_key(CephContext *cct, const ghobject_t& oid, string *key)
 }
 
 /*
- * Reverse of get_object_key().
- * Based on Bluestore implementation.
+ * Reverse of ghobject_t2key().
+ * Based on Bluestore implementation (get_key_object()).
  */
-int get_key_object(const string& key, ghobject_t *oid)
+int key2ghobject_t(const string& key, ghobject_t *oid)
 {
   int r;
   uint64_t pool;
@@ -1149,7 +1149,7 @@ int get_key_object(const string& key, ghobject_t *oid)
  * The order on coll_t is defined by coll_t::operator<
  * The first byte of the output, letter P, T or M  maintain that order.
  */
-void get_coll_key(CephContext *cct, const coll_t& coll, string *key)
+void coll_t2key(CephContext *cct, const coll_t& coll, string *key)
 {
   spg_t pgid;
 
@@ -1175,9 +1175,9 @@ void get_coll_key(CephContext *cct, const coll_t& coll, string *key)
 #define ENCODED_KEY_COLL 10
 /*
  * Get a coll_t from an encoded key use in hse key to represent coll_t
- * Reverse of get_coll_key()
+ * Reverse of coll_t2key()
  */
-int get_key_coll(const string& key, coll_t **coll)
+int key2coll_t(const string& key, coll_t **coll)
 {
   spg_t pgid;
   const char *p = key.c_str();
