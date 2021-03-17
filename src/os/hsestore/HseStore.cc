@@ -831,6 +831,62 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 
 
 
+// some things we encode in binary (as le32 or le64); print the
+// resulting key strings nicely
+static string pretty_binary_string(const string& in)
+{
+  char buf[10];
+  string out;
+  out.reserve(in.length() * 3);
+  enum { NONE, HEX, STRING } mode = NONE;
+  unsigned from = 0, i;
+  for (i=0; i < in.length(); ++i) {
+    if ((in[i] < 32 || (unsigned char)in[i] > 126) ||
+	(mode == HEX && in.length() - i >= 4 &&
+	 ((in[i] < 32 || (unsigned char)in[i] > 126) ||
+	  (in[i+1] < 32 || (unsigned char)in[i+1] > 126) ||
+	  (in[i+2] < 32 || (unsigned char)in[i+2] > 126) ||
+	  (in[i+3] < 32 || (unsigned char)in[i+3] > 126)))) {
+      if (mode == STRING) {
+	out.append(in.substr(from, i - from));
+	out.push_back('\'');
+      }
+      if (mode != HEX) {
+	out.append("0x");
+	mode = HEX;
+      }
+      if (in.length() - i >= 4) {
+	// print a whole u32 at once
+	snprintf(buf, sizeof(buf), "%08x",
+		 (uint32_t)(((unsigned char)in[i] << 24) |
+			    ((unsigned char)in[i+1] << 16) |
+			    ((unsigned char)in[i+2] << 8) |
+			    ((unsigned char)in[i+3] << 0)));
+	i += 3;
+      } else {
+	snprintf(buf, sizeof(buf), "%02x", (int)(unsigned char)in[i]);
+      }
+      out.append(buf);
+    } else {
+      if (mode != STRING) {
+	out.push_back('\'');
+	mode = STRING;
+	from = i;
+      }
+    }
+  }
+  if (mode == STRING) {
+    out.append(in.substr(from, i - from));
+    out.push_back('\'');
+  }
+  return out;
+}
+
+/*
+ * Reverse hexa encoding.
+ * Integer value 10 is encoded in hexa as 'a'.
+ * This function from 'a' in input returns 10.
+ */
 inline unsigned h2i(uint8_t c)
 {
   if ((c >= '0') && (c <= '9')) {
@@ -872,13 +928,12 @@ static const char *_key_decode_shard(const char *key, shard_id_t *pshard)
  *   Bug: due to implicit character type conversion in comparison it may produce
  *   unexpected ordering.
  */
-template<typename S>
-static void append_escaped(const string &in, S *out)
+static void append_escaped(const string &in, string *out)
 {
   uint8_t hexbyte[in.length() * 3 + 1];
   uint8_t* ptr = &hexbyte[0];
   for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
-    uint8_t u = *i; // Fix the bug in BlueStore and KStore.
+    uint8_t u = *i; // Fix the bug present in BlueStore and KStore.
 
     if (u <= '#') {
       *ptr++ = '#';
@@ -893,15 +948,15 @@ static void append_escaped(const string &in, S *out)
     }
   }
   *ptr++ = '!';
-  out->append(hexbyte, ptr - &hexbyte[0]);
+  out->append((char *)hexbyte, ptr - &hexbyte[0]);
 }
 
-static int decode_escaped(const uint8_t *p, string *out)
+static int decode_escaped(const char *p, string *out)
 {
   uint8_t buff[256];
   uint8_t* ptr = &buff[0];
   uint8_t* max = &buff[252];
-  const uint8_t *orig_p = p;
+  const char *orig_p = p;
   while (*p && *p != '!') {
     if (*p == '#' || *p == '~') {
       unsigned hex = 0;
@@ -929,10 +984,11 @@ static int decode_escaped(const uint8_t *p, string *out)
   return p - orig_p;
 }
 
-#define ENCODED_KEY_PREFIX_LEN (1 + 8 + 4)
+#define ENCODED_KEY_PREFIX_LEN 13 // 1 + 8 + 4
 
 #undef dout_prefix
 #define dout_prefix *_dout << "hsestore "
+static int get_key_object(const string& key, ghobject_t *oid);
 
 /*
  * Convert a ghobject_t into a string that can be used in a hse key.
@@ -953,8 +1009,7 @@ static int decode_escaped(const uint8_t *p, string *out)
  * encoded u64: snap
  * encoded u64: generation
  */
-template<typename S>
-static void get_object_key(CephContext *cct, const ghobject_t& oid, S *key)
+void get_object_key(CephContext *cct, const ghobject_t& oid, string *key)
 {
   key->clear();
 
@@ -1028,8 +1083,7 @@ static void get_object_key(CephContext *cct, const ghobject_t& oid, S *key)
  * Reverse of get_object_key().
  * Based on Bluestore implementation.
  */
-template<typename S>
-static int get_key_object(const S& key, ghobject_t *oid)
+int get_key_object(const string& key, ghobject_t *oid)
 {
   int r;
   uint64_t pool;
@@ -1092,9 +1146,10 @@ static int get_key_object(const S& key, ghobject_t *oid)
 
 /*
  * Convert a coll_t into a 10 bytes "key"
+ * The order on coll_t is defined by coll_t::operator<
+ * The first byte of the output, letter P, T or M  maintain that order.
  */
-template<typename S>
-static void get_coll_key(CephContext *cct, const coll_t& coll, S *key)
+void get_coll_key(CephContext *cct, const coll_t& coll, string *key)
 {
   spg_t pgid;
 
@@ -1102,17 +1157,46 @@ static void get_coll_key(CephContext *cct, const coll_t& coll, S *key)
 
   if (coll.is_pg_prefix(&pgid)) {
     if (coll.is_pg()) {
-      key->append("G");
+      key->append("P"); // TYPE_PG
     } else {
-      key->append("T");
+      key->append("T"); // TYPE_PG_TEMP
     }
-    // 8+4+1 bytes below
-    _key_encode_u64(pgid.pgid.m_pool, key);
-    _key_encode_u32(pgid.pgid.m_seed, key);
+    // 1+4+8 bytes below
     _key_encode_shard(pgid.shard, key);
+    _key_encode_u32(pgid.pgid.m_seed, key);
+    _key_encode_u64(pgid.pgid.m_pool, key);
   } else {
     // Metadata collection
     // 10 bytes
-    key->append("M123456789");
+    key->append("M123456789"); // TYPE_META
   }
+}
+
+#define ENCODED_KEY_COLL 10
+/*
+ * Get a coll_t from an encoded key use in hse key to represent coll_t
+ * Reverse of get_coll_key()
+ */
+int get_key_coll(const string& key, coll_t **coll)
+{
+  spg_t pgid;
+  const char *p = key.c_str();
+
+  if (key.length() != ENCODED_KEY_COLL)
+    return -1;
+
+  if (*p == 'M') {
+    *coll = new coll_t();
+  } else if (*p == 'P') {
+    // Temporary collections are not persisted.
+    p++;
+    p = _key_decode_shard(p, &pgid.shard);
+    p = _key_decode_u32(p, &pgid.pgid.m_seed);
+    p = _key_decode_u64(p, &pgid.pgid.m_pool);
+
+    *coll = new coll_t(pgid);
+  } else {
+    return -1;
+  }
+  return 0;
 }
