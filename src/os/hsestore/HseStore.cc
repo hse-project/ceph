@@ -12,8 +12,10 @@
  *
  */
 
+#include <vector>
 #include <string_view>
 #include <hse/hse.h>
+#include <climits>
 
 #include "common/debug.h"
 #include "HseStore.h"
@@ -24,12 +26,20 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "hsestore(" << path << ") "
 
+#define ENCODED_KEY_PREFIX_LEN 13 // 1 + 8 + 4
+#define ENCODED_KEY_COLL 14
 
 static constexpr std::string_view CEPH_METADATA_KVS_NAME = "ceph-metadata";
+static constexpr std::string_view COLLECTION_KVS_NAME = "collection";
 static constexpr std::string_view COLLECTION_OBJECT_KVS_NAME = "collection-object";
 static constexpr std::string_view OBJECT_DATA_KVS_NAME = "object-data";
 static constexpr std::string_view OBJECT_XATTR_KVS_NAME = "object-xattr";
 static constexpr std::string_view OBJECT_OMAP_KVS_NAME = "object-omap";
+
+static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string *key);
+static int key2ghobject_t(const std::string& key, ghobject_t *oid);
+static void coll_t2key(CephContext *cct, const coll_t& coll, std::string *key);
+static int key2coll_t(const std::string& key, coll_t **coll);
 
 //
 // WaitCondTs functions
@@ -39,7 +49,7 @@ static constexpr std::string_view OBJECT_OMAP_KVS_NAME = "object-omap";
 WaitCondTs::WaitCondTs(TransactionSerialization *ts)
 {
   this->_ts = ts;
-  boost::unique_lock lock(ts->_ts_mutex);
+  boost::unique_lock<boost::mutex> lock(ts->_ts_mutex);
   if (ts->_ts_th_running) {
     ts->_ts_th_waiting.push_back(this);
     lock.unlock();
@@ -53,6 +63,7 @@ WaitCondTs::WaitCondTs(TransactionSerialization *ts)
     lock.unlock();
   }
 }
+
 //
 // Destructor, called when leaving the function queue_transactions()
 // Wakeup the oldest thread queue_transaction() waiting to run.
@@ -60,7 +71,7 @@ WaitCondTs::~WaitCondTs()
 {
   ceph_assert(_ts->_ts_th_running);
 
-  boost::unique_lock lock(_ts->_ts_mutex);
+  boost::unique_lock<boost::mutex> lock(_ts->_ts_mutex);
 
   if (_ts->_ts_th_waiting.empty()) {
     // No thread is queued waiting to run
@@ -113,14 +124,14 @@ bool HseStore::Collection::flush_commit(Context *ctx)
 void HseStore::Collection::queue_wait_persist(Context *ctx, uint64_t t_seq) {
 	TxnWaitPersist *twp = new TxnWaitPersist(ctx, t_seq);
 
-  boost::unique_lock lock(_committed_wait_persist_mtx);
+  boost::unique_lock<std::mutex> lock(_committed_wait_persist_mtx);
   _committed_wait_persist.push_back(twp);
 }
 
 void HseStore::Collection::committed_wait_persist_cb(HseStore::Collection *c)
 {
 
-  boost::unique_lock lock(c->_committed_wait_persist_mtx);
+  boost::unique_lock<std::mutex> lock(c->_committed_wait_persist_mtx);
 
   auto it = c->_committed_wait_persist.begin();
   while (it != c->_committed_wait_persist.end()) {
@@ -158,7 +169,7 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
     HseStore::Collection *c1;
 
     // Record for each collection, the latest committed before starting the sync.
-    boost::shared_lock l{c->_store->coll_lock};
+    boost::shared_lock<ceph::shared_mutex> l{c->_store->coll_lock};
     for (auto const& [key, val] : c->_store->coll_map) {
   		c1 = static_cast<HseStore::Collection*>(val.get());
   		c1->_t_seq_committed_wait_sync = c1->_t_seq_next - 1;
@@ -189,73 +200,221 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
 //
 
 
-HseStore::HseStore(CephContext *cct, const string& path)
+HseStore::HseStore(CephContext *cct, const std::string& path)
   : ObjectStore(cct, path),
     finisher(cct),
     kvdb_name(cct->_conf->hsestore_kvdb)
 {
 }
+
 HseStore::~HseStore()
 {}
 
-
-ObjectStore::CollectionHandle HseStore::create_new_collection(const coll_t& cid)
+ObjectStore::CollectionHandle HseStore::open_collection(const coll_t &cid)
 {
   auto c = ceph::make_ref<HseStore::Collection>(this, cid);
 
-  boost::unique_lock l{coll_lock};
+  std::unique_lock<ceph::shared_mutex> l{coll_lock};
   new_coll_map[cid] = c;
+
   return c;
+}
+
+ObjectStore::CollectionHandle HseStore::create_new_collection(const coll_t& cid)
+{
+  hse_err_t rc = 0;
+
+  auto c = ceph::make_ref<HseStore::Collection>(this, cid);
+
+  std::unique_lock<ceph::shared_mutex> l{coll_lock};
+  new_coll_map[cid] = c;
+
+  return c;
+}
+
+bool HseStore::exists(CollectionHandle &c, const ghobject_t &oid)
+{
+  hse_err_t rc = 0;
+
+  std::string coll_tkey;
+  coll_tkey.reserve();
+  std::string ghobject_tkey;
+
+  coll_t2key(cct, c->cid, &coll_tkey);
+  ghobject_t2key(cct, oid, &ghobject_tkey);
+
+  auto filt_min = std::make_unique<uint8_t[]>(coll_tkey.size() + ghobject_tkey.size());
+  auto filt_max = std::make_unique<uint8_t[]>(coll_tkey.size() + ghobject_tkey.size() + sizeof(uint8_t));
+
+  // HSE_TODO: Use Pierre's encoding functions for coll_t and ghobject_t to create a key
+
+  void *key;
+  bool found = false;
+  // Only need to check existence; ignore value
+  rc = hse_kvs_get(collection_object_kvs, nullptr, key, 0, &found, nullptr, 0, nullptr);
+  if (rc)
+    dout(10) << " failed to check existence of object (" << oid << ") in collection (" << c->cid << ")" << dendl;
+
+  return found;
 }
 
 int HseStore::list_collections(vector<coll_t>& ls)
 {
-  boost::shared_lock l{coll_lock};
+  boost::shared_lock<ceph::shared_mutex> l{coll_lock};
 
   for (auto const& [key, val] : coll_map)
     ls.push_back(key);
+
   return 0;
 }
 
 bool HseStore::collection_exists(const coll_t& c)
 {
-  boost::shared_lock l{coll_lock};
+  boost::shared_lock<ceph::shared_mutex> l{coll_lock};
   return coll_map.count(c);
 }
 
 HseStore::CollectionRef HseStore::get_collection(coll_t cid)
 {
-  boost::shared_lock l{coll_lock};
+  boost::shared_lock<ceph::shared_mutex> l{coll_lock};
   ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
   if (cp == coll_map.end())
     return CollectionRef();
   return cp->second;
 }
+
 int HseStore::remove_collection(coll_t cid, CollectionRef *c)
 {
-  ceph_abort_msg("not supported");
-  return 0;
+  hse_err_t rc = 0;
+
+  std::unique_lock<ceph::shared_mutex> l{coll_lock};
+
+  *c = coll_map[cid];
+  coll_map.erase(cid);
+
+  l.unlock();
+
+  // HSE_TODO: retrieve coll prefix from cid using Pierre's function
+  const void *filt = NULL;
+  const size_t filt_len = 0;
+  // HSE_TODO: substitute 10 out for coll_t encoding length
+  // HSE_TODO: add assertion that pfx_len is len of encoded coll_t for both calls
+  rc = hse_kvs_prefix_delete(collection_kvs, nullptr, filt, filt_len, nullptr);
+  if (rc) {
+    dout(10) << " failed to prefix delete all data pertaining to collection (" <<
+      cid << ") in collection kvs" << dendl;
+    goto err_out;
+  }
+  rc = hse_kvs_prefix_delete(collection_object_kvs, nullptr, filt, filt_len, nullptr);
+  if (rc) {
+    dout(10) << " failed to prefix delete all data pertaining to collection (" <<
+      cid << ") in collection-object kvs" << dendl;
+    goto err_out;
+  }
+
+err_out:
+  return rc ? -hse_err_to_errno(rc) : 0;
 }
+
 int HseStore::create_collection(coll_t cid, unsigned bits, CollectionRef *c)
 {
-  ceph_abort_msg("not supported");
+  *c = ceph::make_ref<Collection>(this, cid);
+
+  std::unique_lock<ceph::shared_mutex> l{coll_lock};
+  new_coll_map[cid] = *c;
+
   return 0;
 }
+
 int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits, int rem)
 {
   ceph_abort_msg("not supported");
   return 0;
 }
+
 int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits)
 {
-  ceph_abort_msg("not supported");
-  return 0;
-}
+  // HSE_TODO: what to do with bits?
+  hse_err_t rc = 0;
+  struct hse_kvs_cursor *cursor;
+  bool eof = false;
 
+  struct hse_kvdb_opspec os;
+  HSE_KVDB_OPSPEC_INIT(&os);
+
+  // reuse the same transaction for each put/delete pairs
+  struct hse_kvdb_txn *txn = hse_kvdb_txn_alloc(kvdb);
+  os.kop_txn = txn;
+
+  const coll_t old_cid = (*c)->cid;
+  const coll_t new_cid = d->cid;
+
+  // HSE_TODO: use encoded coll_t length
+  char filt[13];
+  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, &filt, 13, &cursor);
+  if (rc) {
+    dout(10) << " failed to create cursor while merging collections (" <<
+      old_cid << "->" << new_cid << ")" << dendl;
+    goto err_out;
+  }
+
+  while (!eof) {
+    const void *key;
+    size_t key_len;
+    rc = hse_kvs_cursor_read(cursor, nullptr, &key, &key_len, nullptr, nullptr, &eof);
+    if (rc) {
+      dout(10) << " failed to read from cursor while merging collections ("
+        << old_cid << "->" << new_cid << ")" << dendl;
+      goto err_out;
+    }
+
+    rc = hse_kvdb_txn_begin(kvdb, txn);
+    if (rc) {
+      dout(10) << " failed to commit transaction while merging collections ("
+        << new_cid << ")" << dendl;
+      goto err_out;
+    }
+
+    auto new_key = std::make_unique<std::byte[]>(key_len);
+    // HSE_TODO: replace 13 with len of encoded coll_t
+    memcpy(static_cast<void *>(new_key.get()), key, 13);
+    memcpy(static_cast<void *>(new_key.get()), key + 13, key_len - 13);
+
+    rc = hse_kvs_put(collection_object_kvs, &os, static_cast<void *>(new_key.get()), key_len, nullptr, 0);
+    if (rc) {
+      // ignoring rc from abort since we don't want to mask original error
+      hse_kvdb_txn_abort(kvdb, txn);
+      dout(10) << " failed to read from cursor while merging collections ("
+        << old_cid << "->" << new_cid << ")" << dendl;
+      goto err_out;
+    }
+  }
+
+  // HSE_TODO: evaluate if a prefix delete at the end or individual
+  rc = hse_kvs_prefix_delete(collection_object_kvs, &os, filt, 0, nullptr);
+  if (rc) {
+    hse_kvdb_txn_abort(kvdb, txn);
+    dout(10) << " failed to data from collection while merging collections ("
+      << new_cid << ")" << dendl;
+    goto err_out;
+  }
+
+  rc = hse_kvdb_txn_commit(kvdb, txn);
+  if (rc) {
+    dout(10) << " failed to commit transaction while merging collections ("
+      << new_cid << ")" << dendl;
+    goto err_out;
+  }
+
+err_out:
+  hse_kvdb_txn_free(kvdb, txn);
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
 
 int HseStore::queue_transactions(
   ObjectStore::CollectionHandle& ch,
-  vector<ceph::os::Transaction>& tls,
+  std::vector<ceph::os::Transaction>& tls,
   TrackedOpRef op,
   ThreadPool::TPHandle *handle)
 {
@@ -300,6 +459,7 @@ int HseStore::queue_transactions(
 int HseStore::mount()
 {
   hse_err_t rc = 0;
+  bool eof = false;
 
   rc = hse_kvdb_init();
   if (rc) {
@@ -316,6 +476,12 @@ int HseStore::mount()
   rc = hse_kvdb_kvs_open(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr, &ceph_metadata_kvs);
   if (rc) {
     dout(10) << " failed to open the ceph-metadata kvs" << dendl;
+    goto err_out;
+  }
+
+  rc = hse_kvdb_kvs_open(kvdb, COLLECTION_KVS_NAME.data(), nullptr, &collection_kvs);
+  if (rc) {
+    dout(10) << " failed to open the collection kvs" << dendl;
     goto err_out;
   }
 
@@ -343,6 +509,26 @@ int HseStore::mount()
     goto err_out;
   }
 
+  struct hse_kvs_cursor *cursor;
+  rc = hse_kvs_cursor_create(collection_kvs, nullptr, nullptr, 0, &cursor);
+  if (rc) {
+    dout(10) << " failed to create a cursor for populating the in-memory collection map" << dendl;
+    goto err_out;
+  }
+
+  // HSE_TODO: substitute 10 out for length of coll_t
+  const void *key;
+  size_t key_len;
+  while (!eof) {
+    rc = hse_kvs_cursor_read(cursor, NULL, &key, &key_len, nullptr, 0, &eof);
+    if (rc) {
+      dout(10) << " failed to read cursor for populating initial coll_map" << dendl;
+      goto err_out;
+    }
+
+    // HSE_TODO: use Pierre's coll_t from collection key function to populate coll_map
+  }
+
 err_out:
   return rc ? -hse_err_to_errno(rc) : 0;
 }
@@ -358,6 +544,13 @@ int HseStore::umount()
     goto err_out;
   }
   ceph_metadata_kvs = nullptr;
+
+  rc = hse_kvdb_kvs_close(collection_kvs);
+  if (rc) {
+    dout(10) << " failed to close the collection kvs" << dendl;
+    goto err_out;
+  }
+  collection_kvs = nullptr;
 
   rc = hse_kvdb_kvs_close(collection_object_kvs);
   if (rc) {
@@ -394,6 +587,9 @@ int HseStore::umount()
   }
   kvdb = nullptr;
 
+  new_coll_map.clear();
+  coll_map.clear();
+
 err_out:
   hse_kvdb_fini();
 
@@ -425,6 +621,12 @@ int HseStore::mkfs()
   rc = hse_kvdb_kvs_make(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr);
   if (rc) {
     dout(10) << " failed to make the ceph-metadata kvs" << dendl;
+    goto kvdb_out;
+  }
+
+  rc = hse_kvdb_kvs_make(kvdb, COLLECTION_KVS_NAME.data(), nullptr);
+  if (rc) {
+    dout(10) << " failed to make the collection kvs" << dendl;
     goto kvdb_out;
   }
 
@@ -829,14 +1031,12 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
   // hse_kvdb_txn_commit()
 }
 
-
-
 // some things we encode in binary (as le32 or le64); print the
 // resulting key strings nicely
-static string pretty_binary_string(const string& in)
+static string pretty_binary_string(const std::string& in)
 {
   char buf[10];
-  string out;
+  std::string out;
   out.reserve(in.length() * 3);
   enum { NONE, HEX, STRING } mode = NONE;
   unsigned from = 0, i;
@@ -887,7 +1087,7 @@ static string pretty_binary_string(const string& in)
  * Integer value 10 is encoded in hexa as 'a'.
  * This function from 'a' in input returns 10.
  */
-inline unsigned h2i(uint8_t c)
+static inline unsigned h2i(uint8_t c)
 {
   if ((c >= '0') && (c <= '9')) {
     return c - 0x30;
@@ -900,8 +1100,7 @@ inline unsigned h2i(uint8_t c)
   }
 }
 
-template<typename T>
-static void _key_encode_shard(shard_id_t shard, T *key)
+static void _key_encode_shard(shard_id_t shard, std::string *key)
 {
   key->push_back((char)((uint8_t)shard.id + (uint8_t)0x80));
 }
@@ -928,7 +1127,7 @@ static const char *_key_decode_shard(const char *key, shard_id_t *pshard)
  *   Bug: due to implicit character type conversion in comparison it may produce
  *   unexpected ordering.
  */
-static void append_escaped(const string &in, string *out)
+static void append_escaped(const string &in, std::string *out)
 {
   uint8_t hexbyte[in.length() * 3 + 1];
   uint8_t* ptr = &hexbyte[0];
@@ -984,8 +1183,6 @@ static int decode_escaped(const char *p, string *out)
   return p - orig_p;
 }
 
-#define ENCODED_KEY_PREFIX_LEN 13 // 1 + 8 + 4
-
 #undef dout_prefix
 #define dout_prefix *_dout << "hsestore "
 static int key2ghobject_t(const string& key, ghobject_t *oid);
@@ -1009,7 +1206,7 @@ static int key2ghobject_t(const string& key, ghobject_t *oid);
  * encoded u64: snap
  * encoded u64: generation
  */
-void ghobject_t2key(CephContext *cct, const ghobject_t& oid, string *key)
+static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string *key)
 {
   key->clear();
 
@@ -1083,7 +1280,7 @@ void ghobject_t2key(CephContext *cct, const ghobject_t& oid, string *key)
  * Reverse of ghobject_t2key().
  * Based on Bluestore implementation (get_key_object()).
  */
-int key2ghobject_t(const string& key, ghobject_t *oid)
+static int key2ghobject_t(const std::string& key, ghobject_t *oid)
 {
   int r;
   uint64_t pool;
@@ -1149,7 +1346,7 @@ int key2ghobject_t(const string& key, ghobject_t *oid)
  * The order on coll_t is defined by coll_t::operator<
  * The first byte of the output, letter P, T or M  maintain that order.
  */
-void coll_t2key(CephContext *cct, const coll_t& coll, string *key)
+static void coll_t2key(CephContext *cct, const coll_t& coll, std::string *key)
 {
   spg_t pgid;
 
@@ -1172,12 +1369,11 @@ void coll_t2key(CephContext *cct, const coll_t& coll, string *key)
   }
 }
 
-#define ENCODED_KEY_COLL 10
 /*
  * Get a coll_t from an encoded key use in hse key to represent coll_t
  * Reverse of coll_t2key()
  */
-int key2coll_t(const string& key, coll_t **coll)
+static int key2coll_t(const std::string& key, coll_t **coll)
 {
   spg_t pgid;
   const char *p = key.c_str();
