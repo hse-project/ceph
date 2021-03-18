@@ -220,12 +220,9 @@ HseStore::~HseStore()
 
 ObjectStore::CollectionHandle HseStore::open_collection(const coll_t &cid)
 {
-  auto c = ceph::make_ref<HseStore::Collection>(this, cid);
+  std::shared_lock<ceph::shared_mutex> l{coll_lock};
 
-  std::unique_lock<ceph::shared_mutex> l{coll_lock};
-  new_coll_map[cid] = c;
-
-  return c;
+  return coll_map[cid];
 }
 
 ObjectStore::CollectionHandle HseStore::create_new_collection(const coll_t& cid)
