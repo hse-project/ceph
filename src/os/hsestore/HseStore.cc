@@ -251,12 +251,11 @@ bool HseStore::exists(CollectionHandle &c, const ghobject_t &oid)
 
   auto filt_min = std::make_unique<uint8_t[]>(filt_min_len);
   auto filt_max = std::make_unique<uint8_t[]>(filt_max_len);
-  // guarantees that the last bits of the filt are UINT64_MAX
-  memset(filt_max.get(), 1, filt_max_len);
   memcpy(filt_min.get(), coll_tkey.c_str(), coll_tkey.size());
   memcpy(filt_min.get() + coll_tkey.size(), ghobject_tkey.c_str(), ghobject_tkey.size());
-  memcpy(filt_max.get(), coll_tkey.c_str(), coll_tkey.size());
-  memcpy(filt_max.get() + coll_tkey.size(), ghobject_tkey.c_str(), ghobject_tkey.size());
+  memcpy(filt_max.get(), filt_min.get(), filt_min_len);
+  // guarantees that the last bits of filt_max are UINT64_MAX
+  memset(filt_max.get() + filt_min_len, 0xFF, sizeof(hse_oid_t));
 
   struct hse_kvs_cursor *cursor;
   rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, coll_tkey.c_str(), coll_tkey.size(), &cursor);
@@ -395,9 +394,6 @@ int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits
   std::string newcid_tkey;
   coll_t2key(cct, new_cid, &newcid_tkey);
 
-  // HSE_TODO: should we assert that the sizes of the strings are always the same?
-  // ceph_assert isn't a no-op in any build for whatever reason....
-
   rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, oldcid_tkey.c_str(),
     oldcid_tkey.size(), &cursor);
   if (rc) {
@@ -438,8 +434,9 @@ int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits
       continue;
 
     auto new_key = std::make_unique<uint8_t[]>(key_len);
-    memcpy(static_cast<void *>(new_key.get()), newcid_tkey.c_str(), newcid_tkey.size());
-    memcpy(static_cast<void *>(new_key.get()), key + newcid_tkey.size(), key_len - newcid_tkey.size());
+    memcpy(new_key.get(), newcid_tkey.c_str(), newcid_tkey.size());
+    memcpy(new_key.get() + newcid_tkey.size(), key + newcid_tkey.size(),
+      key_len - newcid_tkey.size());
 
     rc = hse_kvs_put(collection_object_kvs, &os, static_cast<void *>(new_key.get()),
       key_len, nullptr, 0);
@@ -497,9 +494,13 @@ int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits
   const coll_t old_cid = (*c)->cid;
   const coll_t new_cid = d->cid;
 
-  std::string filt;
-  coll_t2key(cct, old_cid, &filt);
-  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, filt.c_str(), filt.size(), &cursor);
+  std::string old_cid_tkey;
+  coll_t2key(cct, old_cid, &old_cid_tkey);
+  std::string new_cid_tkey;
+  coll_t2key(cct, new_cid, &new_cid_tkey);
+
+  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, old_cid_tkey.c_str(),
+    old_cid_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while merging collections (" <<
       old_cid << "->" << new_cid << ')' << dendl;
@@ -525,8 +526,8 @@ int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits
     }
 
     auto new_key = std::make_unique<uint8_t[]>(key_len);
-    memcpy(static_cast<void *>(new_key.get()), key, ENCODED_KEY_COLL);
-    memcpy(static_cast<void *>(new_key.get()), key + ENCODED_KEY_COLL, key_len - ENCODED_KEY_COLL);
+    memcpy(new_key.get(), new_cid_tkey.c_str(), new_cid_tkey.size());
+    memcpy(new_key.get() + ENCODED_KEY_COLL, key + ENCODED_KEY_COLL, key_len - ENCODED_KEY_COLL);
 
     rc = hse_kvs_put(collection_object_kvs, &os, static_cast<void *>(new_key.get()), key_len, nullptr, 0);
     if (rc) {
@@ -538,7 +539,8 @@ int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits
     }
   }
 
-  rc = hse_kvs_prefix_delete(collection_object_kvs, &os, filt.c_str(), filt.size(), nullptr);
+  rc = hse_kvs_prefix_delete(collection_object_kvs, &os, old_cid_tkey.c_str(),
+    old_cid_tkey.size(), nullptr);
   if (rc) {
     hse_kvdb_txn_abort(kvdb, txn);
     dout(10) << " failed to prefix delete data from collection while merging collections ("
@@ -1535,6 +1537,8 @@ static void coll_t2key(CephContext *cct, const coll_t& coll, std::string *key)
     // 10 bytes
     key->append("M123456789"); // TYPE_META
   }
+
+  ceph_assert_always(key->size() == ENCODED_KEY_COLL);
 }
 
 /*
