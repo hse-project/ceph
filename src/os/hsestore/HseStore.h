@@ -120,9 +120,7 @@ class TxnWaitPersist {
   // Sequence number of the transaction.
   uint64_t _t_seq;
 
-
   TxnWaitPersist(Context *ctx, uint64_t t_seq);
-
 
   friend class HseStore;
 };
@@ -162,8 +160,7 @@ class HseStore : public ObjectStore {
     // List of transactions committed and waiting to be persisted.
     //
     std::mutex _committed_wait_persist_mtx; // protect _committed_wait_persist
-    list <TxnWaitPersist *> _committed_wait_persist;
-
+    std::list<TxnWaitPersist *> _committed_wait_persist;
 
     // Add a committed transaction (hse_kvdb_txn_commit() returned) in the list of
     // transaction waiting to be persisted.
@@ -193,7 +190,7 @@ class HseStore : public ObjectStore {
   ceph::shared_mutex coll_lock = ceph::make_shared_mutex("HseStore::coll_lock");
 
   ceph::unordered_map<coll_t, CollectionRef> coll_map;
-  map<coll_t,CollectionRef> new_coll_map;
+  std::map<coll_t, CollectionRef> new_coll_map;
 
   //
   // Ceph Finisher worker thread used to call the Ceph callbacks (Context).
@@ -266,17 +263,13 @@ public:
     return -EOPNOTSUPP;
   }
 
-  CollectionHandle open_collection(const coll_t &cid) override {
-    return {};
-  }
+  CollectionHandle open_collection(const coll_t &cid) override;
 
   CollectionHandle create_new_collection(const coll_t &cid) override;
 
   void set_collection_commit_queue(const coll_t &cid, ContextQueue *commit_queue) override {}
 
-  bool exists(CollectionHandle &c, const ghobject_t &oid) override {
-    return true;
-  }
+  bool exists(CollectionHandle &c, const ghobject_t &oid) override;
 
   int set_collection_opts(CollectionHandle& c, const pool_opts_t &opts) override {
     return -EOPNOTSUPP;
@@ -320,9 +313,7 @@ public:
 
   bool collection_exists(const coll_t& c) override;
 
-  int collection_empty(CollectionHandle &c, bool *empty) override {
-    return -EOPNOTSUPP;
-  }
+  int collection_empty(CollectionHandle &c, bool *empty) override;
 
   int collection_bits(CollectionHandle &c) override {
     return -EOPNOTSUPP;
@@ -385,6 +376,7 @@ private:
 
   struct hse_kvdb *kvdb;
   struct hse_kvs *ceph_metadata_kvs;
+  struct hse_kvs *collection_kvs;
   struct hse_kvs *collection_object_kvs;
   struct hse_kvs *object_data_kvs;
   struct hse_kvs *object_xattr_kvs;
