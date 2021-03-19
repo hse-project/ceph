@@ -313,9 +313,7 @@ public:
 
   bool collection_exists(const coll_t& c) override;
 
-  int collection_empty(CollectionHandle &c, bool *empty) override {
-    return -EOPNOTSUPP;
-  }
+  int collection_empty(CollectionHandle &c, bool *empty) override;
 
   int collection_bits(CollectionHandle &c) override {
     return -EOPNOTSUPP;

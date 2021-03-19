@@ -310,6 +310,42 @@ HseStore::CollectionRef HseStore::get_collection(coll_t cid)
   return cp->second;
 }
 
+int HseStore::collection_empty(CollectionHandle &c, bool *empty)
+{
+  hse_err_t rc = 0;
+
+  std::string coll_tkey;
+  coll_t2key(cct, c->cid, &coll_tkey);
+
+  struct hse_kvs_cursor *cursor;
+  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, coll_tkey.c_str(),
+    coll_tkey.size(), &cursor);
+  if (rc) {
+    dout(10) << " failed to create cursor while checking if collection ("
+      << c->cid << ") is empty" << dendl;
+    goto err_out;
+  }
+
+  rc = hse_kvs_cursor_read(cursor, nullptr, nullptr, nullptr, nullptr, nullptr,
+    empty);
+  if (rc) {
+    dout(10) << " failed to read from cursor while checking if collection ("
+      << c->cid << ") is empty" << dendl;
+    goto destroy_cursor;
+  }
+
+destroy_cursor:
+  rc = hse_kvs_cursor_destroy(cursor);
+  if (rc) {
+    dout(10) << " failed to destroy cursor while checking if collection ("
+      << c->cid << ") is empty" << dendl;
+    goto err_out;
+  }
+
+err_out:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
 int HseStore::remove_collection(coll_t cid, CollectionRef *c)
 {
   hse_err_t rc = 0;
