@@ -886,14 +886,14 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 
   // Start a hse transaction.
 
-  vector<CollectionRef> cvec(i.colls.size());
+  std::vector<CollectionRef> cvec(i.colls.size());
   unsigned j = 0;
-  for (auto c: i.colls) {
+  for (auto c : i.colls) {
     cvec[j++] = get_collection(c);
   }
 
   for (int pos = 0; i.have_op(); ++pos) {
-    Transaction::Op *op = i.decode_op();
+    const Transaction::Op *op = i.decode_op();
     int r = 0;
 
     // no coll or obj
@@ -905,20 +905,20 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     switch (op->op) {
     case Transaction::OP_RMCOLL:
       {
-        coll_t cid = i.get_cid(op->cid);
-	r = remove_collection(cid, &c);
-	if (!r)
-	  continue;
+        const coll_t &cid = i.get_cid(op->cid);
+        r = remove_collection(cid, &c);
+        if (!r)
+          continue;
       }
       break;
 
     case Transaction::OP_MKCOLL:
       {
-	ceph_assert(!c);
-        coll_t cid = i.get_cid(op->cid);
-	r = create_collection(cid, op->split_bits, &c);
-	if (!r)
-	  continue;
+        ceph_assert(!c);
+        const coll_t &cid = i.get_cid(op->cid);
+        r = create_collection(cid, op->split_bits, &c);
+        if (!r)
+          continue;
       }
       break;
 
@@ -928,26 +928,26 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 
     case Transaction::OP_SPLIT_COLLECTION2:
       {
-        uint32_t bits = op->split_bits;
-        uint32_t rem = op->split_rem;
-	r = split_collection(c, cvec[op->dest_cid], bits, rem);
-	if (!r)
-	  continue;
+        const uint32_t bits = op->split_bits;
+        const uint32_t rem = op->split_rem;
+        r = split_collection(c, cvec[op->dest_cid], bits, rem);
+        if (!r)
+          continue;
       }
       break;
 
     case Transaction::OP_MERGE_COLLECTION:
       {
-        uint32_t bits = op->split_bits;
-	r = merge_collection(&c, cvec[op->dest_cid], bits);
-	if (!r)
-	  continue;
+        const uint32_t bits = op->split_bits;
+	      r = merge_collection(&c, cvec[op->dest_cid], bits);
+        if (!r)
+          continue;
       }
       break;
 
     case Transaction::OP_COLL_HINT:
       {
-  	ceph_abort_msg("not supported");
+  	    ceph_abort_msg("not supported");
       }
       break;
 
@@ -963,6 +963,7 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       ceph_abort_msg("not implemented");
       break;
     }
+
     if (r < 0) {
 	    /*
       derr << " error " << cpp_strerror(r)
