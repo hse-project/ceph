@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <hse/hse.h>
+#include <hse/hse_limits.h>
 #include <climits>
 #include <cstring>
 
@@ -219,6 +220,42 @@ HseStore::HseStore(CephContext *cct, const std::string& path)
 
 HseStore::~HseStore()
 {}
+
+int HseStore::write_meta(const std::string& key, const std::string& value)
+{
+  hse_err_t rc = 0;
+  const size_t encoded_key_size = key.size() + 1;
+  auto encoded_key = std::make_unique<uint8_t[]>(key.size() + 1);
+
+  encoded_key[0] = 'G';
+  memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
+  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
+    value.c_str(), value.size());
+  if (rc)
+    dout(10) << " failed to write metadata (" << key << ", " << value << ')' << dendl;
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::read_meta(const std::string& key, std::string *value)
+{
+  hse_err_t rc = 0;
+  bool found = false;
+  char buf[HSE_KVS_VLEN_MAX];
+  const size_t encoded_key_size = key.size() + 1;
+  auto encoded_key = std::make_unique<uint8_t[]>(key.size() + 1);
+
+  encoded_key[0] = 'G';
+  memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
+  rc = hse_kvs_get(ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
+    &found, buf, sizeof(buf), nullptr);
+  if (rc)
+    dout(10) << " failed to read metadata (" << key << ')' << dendl;
+  if (found)
+    *value = std::string(buf);
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
 
 ObjectStore::CollectionHandle HseStore::open_collection(const coll_t &cid)
 {
