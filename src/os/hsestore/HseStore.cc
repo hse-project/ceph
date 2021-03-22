@@ -225,7 +225,7 @@ int HseStore::write_meta(const std::string& key, const std::string& value)
 {
   hse_err_t rc = 0;
   const size_t encoded_key_size = key.size() + 1;
-  auto encoded_key = std::make_unique<uint8_t[]>(key.size() + 1);
+  auto encoded_key = std::make_unique<uint8_t[]>(encoded_key_size);
 
   encoded_key[0] = 'G';
   memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
@@ -243,7 +243,7 @@ int HseStore::read_meta(const std::string& key, std::string *value)
   bool found = false;
   char buf[HSE_KVS_VLEN_MAX];
   const size_t encoded_key_size = key.size() + 1;
-  auto encoded_key = std::make_unique<uint8_t[]>(key.size() + 1);
+  auto encoded_key = std::make_unique<uint8_t[]>(encoded_key_size);
 
   encoded_key[0] = 'G';
   memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
