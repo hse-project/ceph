@@ -169,6 +169,51 @@ void HseStore::Collection::committed_wait_persist_cb(HseStore::Collection *c)
 //
 // Syncer functions
 //
+#pragma push_macro("dout_prefix")
+#pragma push_macro("dout_context")
+#undef dout_prefix
+#undef dout_context
+#define dout_prefix *_dout << "hsestore "
+#define dout_context store->cct
+
+// Sync the whole kvdb
+void Syncer::kvdb_sync(HseStore *store)
+{
+  hse_err_t rc = 0;
+  HseStore::Collection *c;
+  bool needsync = false;
+
+  // Record for each collection, the latest committed before starting the sync.
+  std::shared_lock<ceph::shared_mutex> l{store->coll_lock};
+  for (auto const& [key, val] : store->coll_map) {
+    c = static_cast<HseStore::Collection*>(val.get());
+    c->_t_seq_committed_wait_sync = c->_t_seq_next - 1;
+    if (c->_t_seq_persisted_latest < c->_t_seq_committed_wait_sync)
+      needsync = true;
+  }
+  l.unlock();
+
+  if (!needsync)
+    return;
+
+  rc = hse_kvdb_sync(store->kvdb);
+  if (rc) {
+    dout(10) << " failed to sync the kvdb" << dendl;
+    return;
+  }
+
+  // Record the latest transaction persisted.
+  l.lock();
+  for (auto const& [key, val] : store->coll_map) {
+    c = static_cast<HseStore::Collection*>(val.get());
+    c->_t_seq_persisted_latest = c->_t_seq_committed_wait_sync;
+
+    // Invoke the Ceph "commit" callback for all the transactions that had
+    // been committed and are now persisted.
+    HseStore::Collection::committed_wait_persist_cb(c);
+  }
+  l.unlock();
+}
 
 // flush_commit() requested a sync
 void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_committed_at_flush)
@@ -177,33 +222,25 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
     //
     // We have to sync
     //
-    HseStore::Collection *c1;
-
-    // Record for each collection, the latest committed before starting the sync.
-    boost::shared_lock<ceph::shared_mutex> l{c->_store->coll_lock};
-    for (auto const& [key, val] : c->_store->coll_map) {
-  		c1 = static_cast<HseStore::Collection*>(val.get());
-  		c1->_t_seq_committed_wait_sync = c1->_t_seq_next - 1;
-    }
-    l.unlock();
-
-    // hse_sync()
-
-    // Record the latest transaction persisted.
-    l.lock();
-    for (auto const& [key, val] : c->_store->coll_map) {
-      c1 = static_cast<HseStore::Collection*>(val.get());
-      c1->_t_seq_persisted_latest = c1->_t_seq_committed_wait_sync;
-
-      // Invoke the Ceph "commit" callback for all the transactions that had
-      // been committed  and are now persisted.
-      HseStore::Collection::committed_wait_persist_cb(c1);
-    }
-    l.unlock();
+    Syncer::kvdb_sync(c->_store);
   }
 
+  // Call the flush_commit() callback.
   c->_store->finisher.queue(ctx);
 }
+
+void Syncer::timer_cb(const boost::system::error_code& e, boost::asio::deadline_timer* timer,
+    HseStore* store)
+{
+  Syncer::kvdb_sync(store);
+
+  // Restart the timer.
+  timer->expires_from_now(boost::posix_time::milliseconds(SYNCER_PERIOD_MS));
+  timer->async_wait(boost::bind(Syncer::timer_cb,
+        boost::asio::placeholders::error, timer, store));
+}
+#pragma pop_macro("dout_prefix")
+#pragma pop_macro("dout_context")
 
 
 //
@@ -326,7 +363,7 @@ err_out:
 
 int HseStore::list_collections(vector<coll_t>& ls)
 {
-  boost::shared_lock<ceph::shared_mutex> l{coll_lock};
+  std::shared_lock<ceph::shared_mutex> l{coll_lock};
 
   for (auto const& [key, val] : coll_map)
     ls.push_back(key);
@@ -336,13 +373,13 @@ int HseStore::list_collections(vector<coll_t>& ls)
 
 bool HseStore::collection_exists(const coll_t& c)
 {
-  boost::shared_lock<ceph::shared_mutex> l{coll_lock};
+  std::shared_lock<ceph::shared_mutex> l{coll_lock};
   return coll_map.count(c);
 }
 
 HseStore::CollectionRef HseStore::get_collection(coll_t cid)
 {
-  boost::shared_lock<ceph::shared_mutex> l{coll_lock};
+  std::shared_lock<ceph::shared_mutex> l{coll_lock};
   ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
   if (cp == coll_map.end())
     return CollectionRef();
@@ -1626,6 +1663,7 @@ static int key2ghobject_t(const std::string_view key, ghobject_t &oid)
  * Convert a coll_t into a 10 bytes "key"
  * The order on coll_t is defined by coll_t::operator<
  * The first byte of the output, letter P, T or M  maintain that order.
+ * The output is always 14 bytes: 1 (type) + 1 (shard) + 4 (seed) + 8 (pool)
  */
 static void coll_t2key(CephContext *cct, const coll_t& coll, std::string *key)
 {
@@ -1646,7 +1684,7 @@ static void coll_t2key(CephContext *cct, const coll_t& coll, std::string *key)
   } else {
     // Metadata collection
     // 10 bytes
-    key->append("M123456789"); // TYPE_META
+    key->append("M1234567890123"); // TYPE_META
   }
 
   ceph_assert_always(key->size() == ENCODED_KEY_COLL);

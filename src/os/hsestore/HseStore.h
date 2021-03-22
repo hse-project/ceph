@@ -395,19 +395,28 @@ private:
 //
 // Handle syncing transactions. Aka making mutation done via transactions persistent.
 //
+#define SYNCER_PERIOD_MS 50 // Sync every 50 ms.
 class Syncer {
   HseStore *_store;
 
   // Work queue used by the syncer, contains sync requests (flush_commit())
   boost::asio::io_service _sync_wq;
 
+  boost::asio::io_service::work _work; 
+  boost::asio::deadline_timer _timer;
+
   // Thread group for the thread running the _sync_wq
   boost::thread_group _worker_threads;
+
+
+  static void timer_cb(const boost::system::error_code& e, boost::asio::deadline_timer* timer,
+    HseStore* store);
 
   // Function called when flush_commit() is called
   static void do_sync(HseStore::Collection *c, Context *ctx,
     uint64_t t_seq_committed_at_flush);
 
+  static void kvdb_sync(HseStore *store);
 
 public:
   void post_sync(HseStore::Collection *c, Context *ctx,
@@ -417,10 +426,15 @@ public:
   }
 
   // Constructor
-  Syncer()
+  Syncer() : _work(_sync_wq), _timer(_sync_wq, boost::posix_time::milliseconds(SYNCER_PERIOD_MS))
   {
-    new boost::asio::io_service::work(_sync_wq);
+
+    // Only one thread to serve the work queue to avoid processing work items in parallel.
     _worker_threads.create_thread(boost::bind(&boost::asio::io_service::run, &_sync_wq));
+
+    // Start the timer.
+    _timer.async_wait(boost::bind(timer_cb,
+        boost::asio::placeholders::error, &_timer, _store));
   }
 
   // Destructor
