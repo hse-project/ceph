@@ -655,7 +655,7 @@ int HseStore::mount()
   hse_err_t rc = 0;
   bool eof = false;
   bool fsid_found = false;
-  static constexpr const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
+  static const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
   char fsid_buf[fsid.uuid.size()];
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
@@ -891,7 +891,7 @@ void HseStore::set_fsid(uuid_d u)
 {
   hse_err_t rc = 0;
 
-  static constexpr const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
+  static const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
 
   // -1 removes NUL byte
   rc = hse_kvs_put(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,

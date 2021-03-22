@@ -271,6 +271,7 @@ public:
 
   bool exists(CollectionHandle &c, const ghobject_t &oid) override;
 
+  // HSE_TODO: determine if we can take use any of the keys defined for pool_opts_t
   int set_collection_opts(CollectionHandle& c, const pool_opts_t &opts) override {
     return -EOPNOTSUPP;
   }
