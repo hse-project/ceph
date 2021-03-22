@@ -38,7 +38,7 @@ static_assert(sizeof(char) == sizeof(uint8_t));
 
 #define ENCODED_KEY_PREFIX_LEN 13 // 1 + 8 + 4
 #define ENCODED_KEY_COLL 14
-#define GENERAL_METADATA_KEY(key) ("G" key)
+#define CEPH_METADATA_GENERAL_KEY(key) ("G" key)
 
 static constexpr std::string_view CEPH_METADATA_KVS_NAME = "ceph-metadata";
 static constexpr std::string_view COLLECTION_KVS_NAME = "collection";
@@ -692,7 +692,7 @@ int HseStore::mount()
   hse_err_t rc = 0;
   bool eof = false;
   bool fsid_found = false;
-  static const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
+  static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
   char fsid_buf[fsid.uuid.size()];
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
@@ -928,7 +928,7 @@ void HseStore::set_fsid(uuid_d u)
 {
   hse_err_t rc = 0;
 
-  static const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
+  static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
 
   // -1 removes NUL byte
   rc = hse_kvs_put(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
