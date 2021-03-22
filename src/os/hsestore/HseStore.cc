@@ -15,11 +15,16 @@
 #include <vector>
 #include <string>
 #include <string_view>
-#include <hse/hse.h>
 #include <climits>
 #include <cstring>
 
+extern "C" {
+  #include <hse/hse.h>
+  #include <hse/hse_limits.h>
+}
+
 #include "common/debug.h"
+#include "include/uuid.h"
 #include "HseStore.h"
 #include "os/kv.h"
 
@@ -36,6 +41,7 @@ static_assert(sizeof(char) == sizeof(uint8_t));
 
 #define ENCODED_KEY_PREFIX_LEN 13 // 1 + 8 + 4
 #define ENCODED_KEY_COLL 14
+#define CEPH_METADATA_GENERAL_KEY(key) ("G" key)
 
 static constexpr std::string_view CEPH_METADATA_KVS_NAME = "ceph-metadata";
 static constexpr std::string_view COLLECTION_KVS_NAME = "collection";
@@ -217,6 +223,42 @@ HseStore::HseStore(CephContext *cct, const std::string& path)
 
 HseStore::~HseStore()
 {}
+
+int HseStore::write_meta(const std::string& key, const std::string& value)
+{
+  hse_err_t rc = 0;
+  const size_t encoded_key_size = key.size() + 1;
+  auto encoded_key = std::make_unique<uint8_t[]>(encoded_key_size);
+
+  encoded_key[0] = 'G';
+  memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
+  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
+    value.c_str(), value.size());
+  if (rc)
+    dout(10) << " failed to write metadata (" << key << ", " << value << ')' << dendl;
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::read_meta(const std::string& key, std::string *value)
+{
+  hse_err_t rc = 0;
+  bool found = false;
+  char buf[HSE_KVS_VLEN_MAX];
+  const size_t encoded_key_size = key.size() + 1;
+  auto encoded_key = std::make_unique<uint8_t[]>(encoded_key_size);
+
+  encoded_key[0] = 'G';
+  memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
+  rc = hse_kvs_get(ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
+    &found, buf, sizeof(buf), nullptr);
+  if (rc)
+    dout(10) << " failed to read metadata (" << key << ')' << dendl;
+  if (found)
+    *value = std::string(buf);
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
 
 ObjectStore::CollectionHandle HseStore::open_collection(const coll_t &cid)
 {
@@ -652,6 +694,9 @@ int HseStore::mount()
 {
   hse_err_t rc = 0;
   bool eof = false;
+  bool fsid_found = false;
+  static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
+  char fsid_buf[fsid.uuid.size()];
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
   rc = hse_kvdb_init();
@@ -732,6 +777,19 @@ int HseStore::mount()
   rc = hse_kvs_cursor_destroy(cursor);
   if (rc) {
     dout(10) << " failed to destroy cursor while populating initial coll_map" << dendl;
+    goto err_out;
+  }
+
+  // -1 removed the NUL byte
+  rc = hse_kvs_get(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+    &fsid_found, fsid_buf, sizeof(fsid_buf), nullptr);
+  if (rc) {
+    dout(10) << " failed to get fsid" << dendl;
+    goto err_out;
+  }
+  if (fsid_found && !fsid.parse(fsid_buf)) {
+    dout(10) << " failed to parse fsid" << dendl;
+    rc = ENOTRECOVERABLE;
     goto err_out;
   }
 
@@ -867,6 +925,25 @@ err_out:
   hse_kvdb_fini();
 
   return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+void HseStore::set_fsid(uuid_d u)
+{
+  hse_err_t rc = 0;
+
+  static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
+
+  // -1 removes NUL byte
+  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+    u.bytes(), u.uuid.size());
+
+  fsid = u;
+
+  if (rc) {
+    char buf[256];
+    hse_err_to_string(rc, buf, sizeof(buf), nullptr);
+    ceph_abort_msgf("Failed to put fsid into the %s KVS: %s", CEPH_METADATA_KVS_NAME, buf);
+  }
 }
 
 // Process (till hse_kvdb_txn_commit() returns) one transaction

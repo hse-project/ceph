@@ -22,9 +22,12 @@
 #include <set>
 #include <vector>
 #include <optional>
-#include <hse/hse.h>
-#include <hse/hse_limits.h>
 #include <string_view>
+
+extern "C" {
+  #include <hse/hse.h>
+  #include <hse/hse_limits.h>
+}
 
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/unordered_set.hpp>
@@ -263,6 +266,9 @@ public:
     return -EOPNOTSUPP;
   }
 
+  int write_meta(const std::string& key, const std::string& value) override;
+  int read_meta(const std::string& key, std::string *value) override;
+
   CollectionHandle open_collection(const coll_t &cid) override;
 
   CollectionHandle create_new_collection(const coll_t &cid) override;
@@ -271,6 +277,7 @@ public:
 
   bool exists(CollectionHandle &c, const ghobject_t &oid) override;
 
+  // HSE_TODO: determine if we can take use any of the keys defined for pool_opts_t
   int set_collection_opts(CollectionHandle& c, const pool_opts_t &opts) override {
     return -EOPNOTSUPP;
   }
@@ -363,9 +370,9 @@ public:
     return {};
   }
 
-  void set_fsid(uuid_d u) override {}
-  uuid_d get_fsid() {
-    return {};
+  void set_fsid(uuid_d u) override;
+  uuid_d get_fsid() override {
+    return fsid;
   }
 
   uint64_t estimate_objects_overhead(uint64_t num_objects) {
@@ -373,6 +380,7 @@ public:
   }
 private:
   std::string_view kvdb_name;
+  uuid_d fsid;
 
   struct hse_kvdb *kvdb;
   struct hse_kvs *ceph_metadata_kvs;
