@@ -363,9 +363,9 @@ public:
     return {};
   }
 
-  void set_fsid(uuid_d u) override {}
-  uuid_d get_fsid() {
-    return {};
+  void set_fsid(uuid_d u) override;
+  uuid_d get_fsid() override {
+    return fsid;
   }
 
   uint64_t estimate_objects_overhead(uint64_t num_objects) {
@@ -373,6 +373,7 @@ public:
   }
 private:
   std::string_view kvdb_name;
+  uuid_d fsid;
 
   struct hse_kvdb *kvdb;
   struct hse_kvs *ceph_metadata_kvs;

@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "common/debug.h"
+#include "include/uuid.h"
 #include "HseStore.h"
 #include "os/kv.h"
 
@@ -36,6 +37,7 @@ static_assert(sizeof(char) == sizeof(uint8_t));
 
 #define ENCODED_KEY_PREFIX_LEN 13 // 1 + 8 + 4
 #define ENCODED_KEY_COLL 14
+#define GENERAL_METADATA_KEY(key) ("G" key)
 
 static constexpr std::string_view CEPH_METADATA_KVS_NAME = "ceph-metadata";
 static constexpr std::string_view COLLECTION_KVS_NAME = "collection";
@@ -652,6 +654,9 @@ int HseStore::mount()
 {
   hse_err_t rc = 0;
   bool eof = false;
+  bool fsid_found = false;
+  static constexpr const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
+  char fsid_buf[fsid.uuid.size()];
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
   rc = hse_kvdb_init();
@@ -732,6 +737,19 @@ int HseStore::mount()
   rc = hse_kvs_cursor_destroy(cursor);
   if (rc) {
     dout(10) << " failed to destroy cursor while populating initial coll_map" << dendl;
+    goto err_out;
+  }
+
+  // -1 removed the NUL byte
+  rc = hse_kvs_get(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+    &fsid_found, fsid_buf, sizeof(fsid_buf), nullptr);
+  if (rc) {
+    dout(10) << " failed to get fsid" << dendl;
+    goto err_out;
+  }
+  if (fsid_found && !fsid.parse(fsid_buf)) {
+    dout(10) << " failed to parse fsid" << dendl;
+    rc = ENOTRECOVERABLE;
     goto err_out;
   }
 
@@ -867,6 +885,25 @@ err_out:
   hse_kvdb_fini();
 
   return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+void HseStore::set_fsid(uuid_d u)
+{
+  hse_err_t rc = 0;
+
+  static constexpr const char fsid_key[] = GENERAL_METADATA_KEY("fsid");
+
+  // -1 removes NUL byte
+  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+    u.bytes(), u.uuid.size());
+
+  fsid = u;
+
+  if (rc) {
+    char buf[256];
+    hse_err_to_string(rc, buf, sizeof(buf), nullptr);
+    ceph_abort_msgf("Failed to put fsid into the %s KVS: %s", CEPH_METADATA_KVS_NAME, buf);
+  }
 }
 
 // Process (till hse_kvdb_txn_commit() returns) one transaction
