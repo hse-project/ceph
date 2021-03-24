@@ -128,10 +128,46 @@ class TxnWaitPersist {
 class Syncer;
 
 class HseStore : public ObjectStore {
+  public:
   using hse_oid_t = uint64_t;
+
+  private:
   Syncer *_syncer;
+  //
+  // Next hse_oid to assign to a new Ceph object.
+  std::atomic<uint64_t> _hse_oid;
+
+  // Information about one object referenced by a Ceph transaction.
+  // The lifetime of an Onode is the same as its transaction.
+  // The goal of an Onode is to avoid doing the same processing several times in a transaction.
+  // For example:
+  // - recomputing ghobject_t2key for each operation of the transaction that uses a same object.
+  // - redoing the lookup ghobject_t2key -> hse_oid_t for each operation of the transaction 
+  //   that uses a same object.
+  //
+  struct Onode {
+    // True if get_onode() has been called for this node.
+    bool o_gotten;
+
+    const ghobject_t *o_oid;
+    std::string o_ghobject_tkey;
+
+    // True if the object is KVS collection_object_kvs
+    bool o_exists;
+    hse_oid_t o_hse_oid;
+
+    // Object not yet in KVS collection_object_kvs, but the operation will create the object and
+    // put it in the KVS. 
+    // It is a new object.
+    bool o_dirty;
+
+    // Default constructor
+    Onode() : o_gotten(false), o_oid(nullptr), o_exists(false), o_dirty(false) {
+    }
+  };
 
   class Collection : public ObjectStore::CollectionImpl {
+    std::string _coll_tkey;
     HseStore *_store;
     Syncer *_syncer;
     TransactionSerialization _ts;
@@ -171,6 +207,9 @@ class HseStore : public ObjectStore {
     // and have been persisted.
     static void committed_wait_persist_cb(HseStore::Collection *c);
 
+    // Onode is a object for which we got its hse_oid.
+    void get_onode(Onode& o, const ghobject_t& oid, bool create);
+
     public:
     // Constructor
     Collection(HseStore *store, coll_t cid);
@@ -198,10 +237,21 @@ class HseStore : public ObjectStore {
   Finisher finisher;
 
   void start_one_transaction(Collection *c, Transaction *t);
-  int remove_collection(coll_t cid, CollectionRef *c);
-  int create_collection(coll_t cid, unsigned bits, CollectionRef *c);
-  int split_collection(CollectionRef& c, CollectionRef& d, unsigned bits, int rem);
-  int merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits);
+  hse_err_t remove_collection(struct hse_kvdb_opspec *os, coll_t cid, CollectionRef *c);
+  hse_err_t create_collection(coll_t cid, unsigned bits, CollectionRef *c);
+  hse_err_t split_collection(struct hse_kvdb_opspec *os, CollectionRef& c, CollectionRef& d,
+    unsigned bits, int rem);
+  hse_err_t merge_collection(struct hse_kvdb_opspec *os, CollectionRef *c, CollectionRef& d,
+      unsigned bits);
+
+  hse_err_t ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid, bool& found,
+    hse_oid_t& hse_oid);
+
+  hse_err_t write(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, uint64_t offset,
+    size_t length, bufferlist& bl, uint32_t fadvise_flags);
+
+  hse_err_t kv_create_obj(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o);
+
 
 
 public:

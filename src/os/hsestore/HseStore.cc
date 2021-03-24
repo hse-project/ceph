@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstring>
 
+#include "common/errno.h"
 #include "common/debug.h"
 #include "include/uuid.h"
 #include "HseStore.h"
@@ -112,6 +113,7 @@ HseStore::Collection::Collection(HseStore *store, coll_t cid)
   : CollectionImpl(store->cct, cid),
     _store(store)
 {
+  coll_t2key(_store->cct, cid, &_coll_tkey);
 }
 
 void HseStore::Collection::flush()
@@ -313,52 +315,12 @@ ObjectStore::CollectionHandle HseStore::create_new_collection(const coll_t& cid)
 
 bool HseStore::exists(CollectionHandle &c, const ghobject_t &oid)
 {
-  hse_err_t rc = 0;
-  const void *found = nullptr;
+  bool found;
+  hse_oid_t hse_oid;
 
-  std::string coll_tkey;
-  std::string ghobject_tkey;
+  ghobject_t2hse_oid(c->cid, oid, found, hse_oid);
 
-  coll_t2key(cct, c->cid, &coll_tkey);
-  ghobject_t2key(cct, oid, &ghobject_tkey);
-
-  const size_t filt_min_len = coll_tkey.size() + ghobject_tkey.size();
-  const size_t filt_max_len = filt_min_len + sizeof(hse_oid_t);
-
-  auto filt_min = std::make_unique<uint8_t[]>(filt_min_len);
-  auto filt_max = std::make_unique<uint8_t[]>(filt_max_len);
-  memcpy(filt_min.get(), coll_tkey.c_str(), coll_tkey.size());
-  memcpy(filt_min.get() + coll_tkey.size(), ghobject_tkey.c_str(), ghobject_tkey.size());
-  memcpy(filt_max.get(), filt_min.get(), filt_min_len);
-  // guarantees that the last bits of filt_max are UINT64_MAX
-  memset(filt_max.get() + filt_min_len, 0xFF, sizeof(hse_oid_t));
-
-  struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, coll_tkey.c_str(), coll_tkey.size(), &cursor);
-  if (rc) {
-    dout(10) << " failed to create cursor when check existence of object ("
-      << oid << ") with collection (" << c->cid << ')' << dendl;
-    goto err_out;
-  }
-
-  // if everything is correct, there is only one key in this range
-  rc = hse_kvs_cursor_seek_range(cursor, nullptr, filt_min.get(),
-    filt_min_len, filt_max.get(), filt_max_len, &found, nullptr);
-  if (rc) {
-    dout(10) << " failed to check existence of object ("
-      << oid << ") in collection (" << c->cid << ')' << dendl;
-    goto err_out;
-  }
-
-  rc = hse_kvs_cursor_destroy(cursor);
-  if (rc) {
-    dout(10) << " failed to destroy cursor while checking existence of object ("
-      << oid << ") in collection (" << c->cid << ')' << dendl;
-    goto err_out;
-  }
-
-err_out:
-  return found != nullptr;
+  return found;
 }
 
 int HseStore::list_collections(vector<coll_t>& ls)
@@ -422,7 +384,9 @@ err_out:
   return rc ? -hse_err_to_errno(rc) : 0;
 }
 
-int HseStore::remove_collection(coll_t cid, CollectionRef *c)
+hse_err_t HseStore::remove_collection(
+    struct hse_kvdb_opspec *os,
+    coll_t cid, CollectionRef *c)
 {
   hse_err_t rc = 0;
   std::string filt;
@@ -434,28 +398,15 @@ int HseStore::remove_collection(coll_t cid, CollectionRef *c)
 
   l.unlock();
 
-  struct hse_kvdb_opspec os;
-  HSE_KVDB_OPSPEC_INIT(&os);
-
-  struct hse_kvdb_txn *txn = hse_kvdb_txn_alloc(kvdb);
-  os.kop_txn = txn;
-
-  rc = hse_kvdb_txn_begin(kvdb, txn);
-  if (rc) {
-    dout(10) << " failed to begin transaction while removing collection("
-      << cid << ')' << dendl;
-    goto err_out;
-  }
-
   coll_t2key(cct, cid, &filt);
-  rc = hse_kvs_prefix_delete(collection_kvs, &os, filt.c_str(), filt.size(),
+  rc = hse_kvs_prefix_delete(collection_kvs, os, filt.c_str(), filt.size(),
     nullptr);
   if (rc) {
     dout(10) << " failed to prefix delete all data pertaining to collection (" <<
       cid << ") in collection kvs" << dendl;
     goto err_out;
   }
-  rc = hse_kvs_prefix_delete(collection_object_kvs, &os, filt.c_str(),
+  rc = hse_kvs_prefix_delete(collection_object_kvs, os, filt.c_str(),
     filt.size(), nullptr);
   if (rc) {
     dout(10) << " failed to prefix delete all data pertaining to collection (" <<
@@ -463,20 +414,11 @@ int HseStore::remove_collection(coll_t cid, CollectionRef *c)
     goto err_out;
   }
 
-  rc = hse_kvdb_txn_commit(kvdb, txn);
-  if (rc) {
-    dout(10) << " failed to commit transaction while removing collection("
-      << cid << ')' << dendl;
-    goto err_out;
-  }
-
 err_out:
-  hse_kvdb_txn_free(kvdb, txn);
-
-  return rc ? -hse_err_to_errno(rc) : 0;
+  return rc;
 }
 
-int HseStore::create_collection(coll_t cid, unsigned bits, CollectionRef *c)
+hse_err_t HseStore::create_collection(coll_t cid, unsigned bits, CollectionRef *c)
 {
   *c = ceph::make_ref<Collection>(this, cid);
 
@@ -486,17 +428,13 @@ int HseStore::create_collection(coll_t cid, unsigned bits, CollectionRef *c)
   return 0;
 }
 
-int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits, int rem)
+hse_err_t HseStore::split_collection(
+    struct hse_kvdb_opspec *os,
+    CollectionRef& c, CollectionRef& d, unsigned bits, int rem)
 {
   hse_err_t rc = 0;
   struct hse_kvs_cursor *cursor;
   bool eof = false;
-
-  struct hse_kvdb_opspec os;
-  HSE_KVDB_OPSPEC_INIT(&os);
-
-  struct hse_kvdb_txn *txn = hse_kvdb_txn_alloc(kvdb);
-  os.kop_txn = txn;
 
   const coll_t old_cid = c->cid;
   const coll_t new_cid = d->cid;
@@ -506,7 +444,7 @@ int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits
   std::string newcid_tkey;
   coll_t2key(cct, new_cid, &newcid_tkey);
 
-  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, oldcid_tkey.c_str(),
+  rc = hse_kvs_cursor_create(collection_object_kvs, os, oldcid_tkey.c_str(),
     oldcid_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while splitting collection ("
@@ -514,17 +452,10 @@ int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits
     goto err_out;
   }
 
-  rc = hse_kvdb_txn_begin(kvdb, txn);
-  if (rc) {
-    dout(10) << " failed to begin transaction while splitting collection ("
-      << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
-  }
-
   while (!eof) {
     const uint8_t *key;
     size_t key_len;
-    rc = hse_kvs_cursor_read(cursor, nullptr, reinterpret_cast<const void **>(&key),
+    rc = hse_kvs_cursor_read(cursor, os, reinterpret_cast<const void **>(&key),
       &key_len, nullptr, nullptr, &eof);
     if (rc) {
       dout(10) << " failed to read from cursor while splitting collections ("
@@ -550,30 +481,20 @@ int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits
     memcpy(new_key.get() + newcid_tkey.size(), key + newcid_tkey.size(),
       key_len - newcid_tkey.size());
 
-    rc = hse_kvs_put(collection_object_kvs, &os, static_cast<void *>(new_key.get()),
+    rc = hse_kvs_put(collection_object_kvs, os, static_cast<void *>(new_key.get()),
       key_len, nullptr, 0);
     if (rc) {
-      // ignoring rc from abort since we don't want to mask original error
-      hse_kvdb_txn_abort(kvdb, txn);
       dout(10) << " failed to read from cursor while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
       goto err_out;
     }
 
-    rc = hse_kvs_delete(collection_object_kvs, &os, key, key_len);
+    rc = hse_kvs_delete(collection_object_kvs, os, key, key_len);
     if (rc) {
-      hse_kvdb_txn_abort(kvdb, txn);
       dout(10) << " failed to data from collection while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
       goto err_out;
     }
-  }
-
-  rc = hse_kvdb_txn_commit(kvdb, txn);
-  if (rc) {
-    dout(10) << " failed to commit transaction while merging collections ("
-      << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
   }
 
   rc = hse_kvs_cursor_destroy(cursor);
@@ -584,24 +505,17 @@ int HseStore::split_collection(CollectionRef& c, CollectionRef& d, unsigned bits
   }
 
 err_out:
-  hse_kvdb_txn_free(kvdb, txn);
-
-  return rc ? -hse_err_to_errno(rc) : 0;
+  return rc;
 }
 
-int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits)
+hse_err_t HseStore::merge_collection(
+    struct hse_kvdb_opspec *os,
+    CollectionRef *c, CollectionRef& d, unsigned bits)
 {
   // HSE_TODO: what to do with bits?
   hse_err_t rc = 0;
   struct hse_kvs_cursor *cursor;
   bool eof = false;
-
-  struct hse_kvdb_opspec os;
-  HSE_KVDB_OPSPEC_INIT(&os);
-
-  // all puts/deletes will use the same opspec
-  struct hse_kvdb_txn *txn = hse_kvdb_txn_alloc(kvdb);
-  os.kop_txn = txn;
 
   const coll_t old_cid = (*c)->cid;
   const coll_t new_cid = d->cid;
@@ -611,7 +525,7 @@ int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits
   std::string new_cid_tkey;
   coll_t2key(cct, new_cid, &new_cid_tkey);
 
-  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, old_cid_tkey.c_str(),
+  rc = hse_kvs_cursor_create(collection_object_kvs, os, old_cid_tkey.c_str(),
     old_cid_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while merging collections (" <<
@@ -619,17 +533,10 @@ int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits
     goto err_out;
   }
 
-  rc = hse_kvdb_txn_begin(kvdb, txn);
-  if (rc) {
-    dout(10) << " failed to begin transaction while merging collections ("
-      << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
-  }
-
   while (!eof) {
     const uint8_t *key;
     size_t key_len;
-    rc = hse_kvs_cursor_read(cursor, nullptr, reinterpret_cast<const void **>(&key),
+    rc = hse_kvs_cursor_read(cursor, os, reinterpret_cast<const void **>(&key),
       &key_len, nullptr, nullptr, &eof);
     if (rc) {
       dout(10) << " failed to read from cursor while merging collections ("
@@ -641,28 +548,18 @@ int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits
     memcpy(new_key.get(), new_cid_tkey.c_str(), new_cid_tkey.size());
     memcpy(new_key.get() + ENCODED_KEY_COLL, key + ENCODED_KEY_COLL, key_len - ENCODED_KEY_COLL);
 
-    rc = hse_kvs_put(collection_object_kvs, &os, static_cast<void *>(new_key.get()), key_len, nullptr, 0);
+    rc = hse_kvs_put(collection_object_kvs, os, static_cast<void *>(new_key.get()), key_len, nullptr, 0);
     if (rc) {
-      // ignoring rc from abort since we don't want to mask original error
-      hse_kvdb_txn_abort(kvdb, txn);
       dout(10) << " failed to put while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
       goto err_out;
     }
   }
 
-  rc = hse_kvs_prefix_delete(collection_object_kvs, &os, old_cid_tkey.c_str(),
+  rc = hse_kvs_prefix_delete(collection_object_kvs, os, old_cid_tkey.c_str(),
     old_cid_tkey.size(), nullptr);
   if (rc) {
-    hse_kvdb_txn_abort(kvdb, txn);
     dout(10) << " failed to prefix delete data from collection while merging collections ("
-      << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
-  }
-
-  rc = hse_kvdb_txn_commit(kvdb, txn);
-  if (rc) {
-    dout(10) << " failed to commit transaction while merging collections ("
       << old_cid << "->" << new_cid << ')' << dendl;
     goto err_out;
   }
@@ -675,9 +572,7 @@ int HseStore::merge_collection(CollectionRef *c, CollectionRef& d, unsigned bits
   }
 
 err_out:
-  hse_kvdb_txn_free(kvdb, txn);
-
-  return rc ? -hse_err_to_errno(rc) : 0;
+  return rc;
 }
 
 int HseStore::queue_transactions(
@@ -961,6 +856,38 @@ err_out:
   return rc ? -hse_err_to_errno(rc) : 0;
 }
 
+/*
+ * Update the Onode if necessary.
+ */
+void HseStore::Collection::get_onode(
+  Onode& o,
+  const ghobject_t& oid,
+  bool create)
+{
+  hse_oid_t hse_oid;
+  bool found;
+
+  if (!o.o_gotten) {
+    o.o_gotten = true;
+    o.o_oid = std::addressof(oid);
+    ghobject_t2key(_store->cct, oid, &o.o_ghobject_tkey);
+  }
+
+  if (o.o_exists || o.o_dirty)
+    return;
+
+
+  this->_store->ghobject_t2hse_oid(this->cid, oid, found, hse_oid);
+
+  if (found) {
+    o.o_hse_oid = hse_oid;
+    o.o_exists = true;
+  } else {
+    if (create)
+      o.o_dirty = true;
+  }
+}
+
 void HseStore::set_fsid(uuid_d u)
 {
   hse_err_t rc = 0;
@@ -980,22 +907,47 @@ void HseStore::set_fsid(uuid_d u)
   }
 }
 
+hse_err_t HseStore::write(
+  struct hse_kvdb_opspec *os,
+  CollectionRef& c,
+  Onode& o,
+  uint64_t offset, size_t length,
+  bufferlist& bl,
+  uint32_t fadvise_flags)
+{
+  hse_err_t rc = 0;
+
+  dout(15) << __func__ << " " << c->cid << " " << *o.o_oid
+	   << " " << offset << "~" << length
+	   << dendl;
+  // _assign_nid(txc, o);
+  // int r = _do_write(txc, o, offset, length, bl, fadvise_flags);
+  // txc->write_onode(o);
+
+  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid
+	   << " " << offset << "~" << length
+	   << " = " << rc << dendl;
+  return rc;
+}
+
 // Process (till hse_kvdb_txn_commit() returns) one transaction
 void HseStore::start_one_transaction(Collection *c, Transaction *t)
 {
+  struct hse_kvdb_opspec os;
+  hse_err_t rc = 0; 
+  HSE_KVDB_OPSPEC_INIT(&os);
   Transaction::iterator i = t->begin();
 
-  /*
-  dout(30) << __func__ << " transaction dump:\n";
-  JSONFormatter f(true);
-  f.open_object_section("transaction");
-  t->dump(&f);
-  f.close_section();
-  f.flush(*_dout);
-  *_dout << dendl;
-  */
-
+  //
   // Start a hse transaction.
+  //
+  os.kop_txn = hse_kvdb_txn_alloc(kvdb);
+  rc = hse_kvdb_txn_begin(kvdb, os.kop_txn);
+  if (rc) {
+    hse_kvdb_txn_free(kvdb, os.kop_txn);
+    dout(10) << __func__ << " failed to begin transaction " << c->cid << dendl;
+    return;
+  }
 
   std::vector<CollectionRef> cvec(i.colls.size());
   unsigned j = 0;
@@ -1003,9 +955,10 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     cvec[j++] = get_collection(c);
   }
 
+  vector<HseStore::Onode> ovec(i.objects.size());
+
   for (int pos = 0; i.have_op(); ++pos) {
     const Transaction::Op *op = i.decode_op();
-    int r = 0;
 
     // no coll or obj
     if (op->op == Transaction::OP_NOP)
@@ -1017,8 +970,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     case Transaction::OP_RMCOLL:
       {
         const coll_t &cid = i.get_cid(op->cid);
-        r = remove_collection(cid, &c);
-        if (!r)
+        rc = remove_collection(&os, cid, &c);
+        if (!rc)
           continue;
       }
       break;
@@ -1027,8 +980,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       {
         ceph_assert(!c);
         const coll_t &cid = i.get_cid(op->cid);
-        r = create_collection(cid, op->split_bits, &c);
-        if (!r)
+        rc = create_collection(cid, op->split_bits, &c);
+        if (!rc)
           continue;
       }
       break;
@@ -1041,8 +994,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       {
         const uint32_t bits = op->split_bits;
         const uint32_t rem = op->split_rem;
-        r = split_collection(c, cvec[op->dest_cid], bits, rem);
-        if (!r)
+        rc = split_collection(&os, c, cvec[op->dest_cid], bits, rem);
+        if (!rc)
           continue;
       }
       break;
@@ -1050,24 +1003,24 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     case Transaction::OP_MERGE_COLLECTION:
       {
         const uint32_t bits = op->split_bits;
-	      r = merge_collection(&c, cvec[op->dest_cid], bits);
-        if (!r)
+	rc = merge_collection(&os, &c, cvec[op->dest_cid], bits);
+        if (!rc)
           continue;
       }
       break;
 
     case Transaction::OP_COLL_HINT:
       {
-  	    ceph_abort_msg("not supported");
+        ceph_abort_msg("not supported");
       }
       break;
 
     case Transaction::OP_COLL_SETATTR:
-      r = -EOPNOTSUPP;
+      rc = EOPNOTSUPP;
       break;
 
     case Transaction::OP_COLL_RMATTR:
-      r = -EOPNOTSUPP;
+      rc = EOPNOTSUPP;
       break;
 
     case Transaction::OP_COLL_RENAME:
@@ -1075,7 +1028,7 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       break;
     }
 
-    if (r < 0) {
+    if (rc != 0) {
 	    /*
       derr << " error " << cpp_strerror(r)
 	   << " not handled on operation " << op->op
@@ -1091,10 +1044,9 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       ceph_abort_msg("unexpected error");
     }
 
-#if 0
     // object operations
-    OnodeRef &o = ovec[op->oid];
-    if (!o) {
+    Onode &o = ovec[op->oid];
+    if (!o.o_gotten) {
       // these operations implicity create the object
       bool create = false;
       if (op->op == Transaction::OP_TOUCH ||
@@ -1103,13 +1055,13 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	  op->op == Transaction::OP_ZERO) {
 	create = true;
       }
-      ghobject_t oid = i.get_oid(op->oid);
-      o = c->get_onode(oid, create);
+      const ghobject_t &oid = i.get_oid(op->oid);
+      c->get_onode(o, oid, create);
       if (!create) {
-	if (!o || !o->exists) {
+	if (!o.o_exists) {
 	  dout(10) << __func__ << " op " << op->op << " got ENOENT on "
 		   << oid << dendl;
-	  r = -ENOENT;
+	  rc = ENOENT;
 	  goto endop;
 	}
       }
@@ -1118,9 +1070,10 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     switch (op->op) {
     case Transaction::OP_TOUCH:
     case Transaction::OP_CREATE:
-	r = _touch(txc, c, o);
+      rc = kv_create_obj(&os, c, o);
       break;
 
+#if 0
     case Transaction::OP_WRITE:
       {
         uint64_t off = op->off;
@@ -1128,7 +1081,7 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	uint32_t fadvise_flags = i.get_fadvise_flags();
         bufferlist bl;
         i.decode_bl(bl);
-	r = _write(txc, c, o, off, len, bl, fadvise_flags);
+	r = write(c, o, off, len, bl, fadvise_flags);
       }
       break;
 
@@ -1291,6 +1244,7 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 			  flags);
       }
       break;
+#endif
 
     default:
       derr << "bad op " << op->op << dendl;
@@ -1298,36 +1252,36 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
     }
 
   endop:
-    if (r < 0) {
+    if (rc != 0) {
       bool ok = false;
 
-      if (r == -ENOENT && !(op->op == Transaction::OP_CLONERANGE ||
+      if (rc == ENOENT && !(op->op == Transaction::OP_CLONERANGE ||
 			    op->op == Transaction::OP_CLONE ||
 			    op->op == Transaction::OP_CLONERANGE2 ||
 			    op->op == Transaction::OP_COLL_ADD))
-	// -ENOENT is usually okay
+	// ENOENT is usually okay
 	ok = true;
-      if (r == -ENODATA)
+      if (rc == ENODATA)
 	ok = true;
 
       if (!ok) {
 	const char *msg = "unexpected error code";
 
-	if (r == -ENOENT && (op->op == Transaction::OP_CLONERANGE ||
+	if (rc == ENOENT && (op->op == Transaction::OP_CLONERANGE ||
 			     op->op == Transaction::OP_CLONE ||
 			     op->op == Transaction::OP_CLONERANGE2))
 	  msg = "ENOENT on clone suggests osd bug";
 
-	if (r == -ENOSPC)
+	if (rc == ENOSPC)
 	  // For now, if we hit _any_ ENOSPC, crash, before we do any damage
 	  // by partially applying transactions.
 	  msg = "ENOSPC from key value store, misconfigured cluster";
 
-	if (r == -ENOTEMPTY) {
+	if (rc == ENOTEMPTY) {
 	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
 	}
 
-	dout(0) << " error " << cpp_strerror(r) << " not handled on operation " << op->op
+	dout(0) << " error " << cpp_strerror(rc) << " not handled on operation " << op->op
 		<< " (op " << pos << ", counting from 0)" << dendl;
 	dout(0) << msg << dendl;
 	dout(0) << " transaction dump:\n";
@@ -1340,14 +1294,21 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	ceph_abort_msg("unexpected error");
       }
     }
-#endif
   }
 
   //
   // Commit the transaction in hse
   //
-
-  // hse_kvdb_txn_commit()
+  if (rc) {
+      hse_kvdb_txn_abort(kvdb, os.kop_txn);
+      dout(10)  << __func__ << " transaction aborted" << dendl;
+  } else {
+    rc = hse_kvdb_txn_commit(kvdb, os.kop_txn);
+    if (rc) {
+      dout(10)  << __func__ << " failed to commit transaction" << dendl;
+    }
+  }
+  hse_kvdb_txn_free(kvdb, os.kop_txn);
 }
 
 // some things we encode in binary (as le32 or le64); print the
@@ -1595,6 +1556,65 @@ static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string 
 }
 
 /*
+ * Get the hse_oid from the ghobject_t looking in collection_object_kvs
+ */
+hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid, bool& found,
+    HseStore::hse_oid_t& hse_oid)
+{
+  hse_err_t rc = 0;
+  const void *foundkey = nullptr;
+  size_t foundkey_len;
+
+  std::string coll_tkey;
+  std::string ghobject_tkey;
+
+  coll_t2key(cct, cid, &coll_tkey);
+  ghobject_t2key(cct, oid, &ghobject_tkey);
+
+  const size_t filt_min_len = coll_tkey.size() + ghobject_tkey.size();
+  const size_t filt_max_len = filt_min_len + sizeof(HseStore::hse_oid_t);
+
+  auto filt_min = std::make_unique<uint8_t[]>(filt_min_len);
+  auto filt_max = std::make_unique<uint8_t[]>(filt_max_len);
+  memcpy(filt_min.get(), coll_tkey.c_str(), coll_tkey.size());
+  memcpy(filt_min.get() + coll_tkey.size(), ghobject_tkey.c_str(), ghobject_tkey.size());
+  memcpy(filt_max.get(), filt_min.get(), filt_min_len);
+  // guarantees that the last bits of filt_max are UINT64_MAX
+  memset(filt_max.get() + filt_min_len, 0xFF, sizeof(HseStore::hse_oid_t));
+
+  struct hse_kvs_cursor *cursor;
+  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, coll_tkey.c_str(), coll_tkey.size(), &cursor);
+  if (rc) {
+    dout(10) << " failed to create cursor when check existence of object ("
+      << oid << ") with collection (" << cid << ')' << dendl;
+    goto err_out;
+  }
+
+  // if everything is correct, there is only one key in this range
+  rc = hse_kvs_cursor_seek_range(cursor, nullptr, filt_min.get(),
+    filt_min_len, filt_max.get(), filt_max_len, &foundkey, &foundkey_len);
+  if (rc) {
+    dout(10) << " failed to check existence of object ("
+      << oid << ") in collection (" << cid << ')' << dendl;
+    goto err_out;
+  }
+
+  // The last 8 bytes of the key are the hse_oid.
+  memcpy(&hse_oid, &(((uint8_t *)foundkey)[foundkey_len - sizeof(hse_oid_t)]),  sizeof(hse_oid_t));
+  found = foundkey != nullptr;
+
+  rc = hse_kvs_cursor_destroy(cursor);
+  if (rc) {
+    dout(10) << " failed to destroy cursor while checking existence of object ("
+      << oid << ") in collection (" << cid << ')' << dendl;
+    goto err_out;
+  }
+
+err_out:
+  return rc;
+}
+
+/*
  * Reverse of ghobject_t2key().
  * Based on Bluestore implementation (get_key_object()).
  */
@@ -1716,4 +1736,35 @@ static int key2coll_t(const std::string_view key, coll_t &coll)
     return -1;
   }
   return 0;
+}
+
+hse_err_t HseStore::kv_create_obj(
+  struct hse_kvdb_opspec *os,
+  CollectionRef& c,
+  Onode& o)
+{
+  size_t klen1;
+  size_t klen2;
+  size_t klen3;
+  hse_err_t rc;
+
+  o.o_hse_oid = this->_hse_oid++;
+
+  klen1 = c->_coll_tkey.size();
+  klen2 = o.o_ghobject_tkey.size();
+  klen3 = sizeof(hse_oid_t);;
+  auto key = std::make_unique<uint8_t[]>(klen1 + klen2 + klen3);
+  memcpy(key.get(), c->_coll_tkey.c_str(), klen1);
+  memcpy(key.get() + klen1, o.o_ghobject_tkey.c_str(), klen2);
+  memcpy(key.get() + klen1 + klen2, &o.o_hse_oid, klen3);
+
+  rc = hse_kvs_put(collection_object_kvs, os, static_cast<void *>(key.get()),
+    klen1 + klen2 + klen3, nullptr, 0);
+  if (rc) {
+    // ignoring rc from abort since we don't want to mask original error
+    hse_kvdb_txn_abort(kvdb, os->kop_txn);
+    dout(10) << __func__ << " failed to put in collection_object_kvs" << dendl;
+  }
+  o.o_exists = true;
+  return rc;
 }
