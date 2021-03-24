@@ -693,10 +693,12 @@ int HseStore::queue_transactions(
 int HseStore::mount()
 {
   hse_err_t rc = 0;
-  bool eof = false;
   bool fsid_found = false;
   static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
-  char fsid_buf[fsid.uuid.size()];
+  // 40 is stolen from BlueStore::_read_fsid()
+  uint8_t fsid_buf[40];
+  memset(fsid_buf, 0, sizeof(fsid_buf));
+  size_t fsid_len;
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
   rc = hse_kvdb_init();
@@ -754,15 +756,19 @@ int HseStore::mount()
     goto err_out;
   }
 
-  const uint8_t *key;
-  size_t key_len;
-  while (!eof) {
-    rc = hse_kvs_cursor_read(cursor, NULL, reinterpret_cast<const void **>(&key),
-      &key_len, nullptr, 0, &eof);
+  const uint8_t *key, *val;
+  size_t key_len, val_len;
+  bool eof;
+  while (true) {
+    rc = hse_kvs_cursor_read(cursor, nullptr, reinterpret_cast<const void **>(&key),
+      &key_len, reinterpret_cast<const void **>(&val), &val_len, &eof);
     if (rc) {
       dout(10) << " failed to read cursor for populating initial coll_map" << dendl;
       goto err_out;
     }
+
+    if (eof)
+      break;
 
     std::string_view coll_tkey { reinterpret_cast<const char *>(key), ENCODED_KEY_COLL };
     coll_t cid;
@@ -782,12 +788,13 @@ int HseStore::mount()
 
   // -1 removed the NUL byte
   rc = hse_kvs_get(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
-    &fsid_found, fsid_buf, sizeof(fsid_buf), nullptr);
+    &fsid_found, fsid_buf, sizeof(fsid_buf), &fsid_len);
   if (rc) {
     dout(10) << " failed to get fsid" << dendl;
     goto err_out;
   }
-  if (fsid_found && !fsid.parse(fsid_buf)) {
+  if (!fsid.parse(reinterpret_cast<char *>(fsid_buf))) {
+    printf("get: %zu %s\n", fsid_len, fsid_buf);
     dout(10) << " failed to parse fsid" << dendl;
     rc = ENOTRECOVERABLE;
     goto err_out;
@@ -864,6 +871,16 @@ err_out:
 int HseStore::mkfs()
 {
   hse_err_t rc = 0;
+  static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
+
+  if (fsid.is_zero()) {
+    fsid.generate_random();
+    dout(1) << " generated fsid " << fsid << dendl;
+  } else {
+    dout(1) << " using provided fsid " << fsid << dendl;
+  }
+
+  const std::string fsid_str = fsid.to_string();
 
   rc = hse_kvdb_init();
   if (rc) {
@@ -872,50 +889,72 @@ int HseStore::mkfs()
 
   /* HSE_TODO: how to handle error logic here */
   rc = hse_kvdb_make(kvdb_name.data(), nullptr);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the kvdb" << dendl;
     goto err_out;
   }
 
   rc = hse_kvdb_open(kvdb_name.data(), nullptr, &kvdb);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to open the kvdb" << dendl;
     goto err_out;
   }
 
   rc = hse_kvdb_kvs_make(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the ceph-metadata kvs" << dendl;
     goto kvdb_out;
   }
 
   rc = hse_kvdb_kvs_make(kvdb, COLLECTION_KVS_NAME.data(), nullptr);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the collection kvs" << dendl;
     goto kvdb_out;
   }
 
   rc = hse_kvdb_kvs_make(kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the collection-object kvs" << dendl;
     goto kvdb_out;
   }
 
   rc = hse_kvdb_kvs_make(kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the object-data kvs" << dendl;
     goto kvdb_out;
   }
 
   rc = hse_kvdb_kvs_make(kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the object-xattr kvs" << dendl;
     goto kvdb_out;
   }
 
   rc = hse_kvdb_kvs_make(kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr);
-  if (rc) {
+  if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the object-omap kvs" << dendl;
+    goto kvdb_out;
+  }
+
+  rc = hse_kvdb_kvs_open(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr,
+    &ceph_metadata_kvs);
+  if (rc) {
+    dout(10) << " failed to open ceph-metadata kvs" << dendl;
+    goto kvdb_out;
+  }
+
+  // -1 removes NUL byte
+  printf("put: %zu %s", fsid_str.size(), fsid_str.c_str());
+  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+    fsid_str.c_str(), fsid_str.size());
+  if (rc) {
+    dout(10) << " failed to persist fsid" << dendl;
+    goto kvdb_out;
+  }
+
+  rc = hse_kvdb_kvs_close(ceph_metadata_kvs);
+  if (rc) {
+    dout(10) << " failed to close ceph-metadata kvs" << dendl;
     goto kvdb_out;
   }
 
@@ -924,26 +963,7 @@ kvdb_out:
 err_out:
   hse_kvdb_fini();
 
-  return rc ? -hse_err_to_errno(rc) : 0;
-}
-
-void HseStore::set_fsid(uuid_d u)
-{
-  hse_err_t rc = 0;
-
-  static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
-
-  // -1 removes NUL byte
-  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
-    u.bytes(), u.uuid.size());
-
-  fsid = u;
-
-  if (rc) {
-    char buf[256];
-    hse_err_to_string(rc, buf, sizeof(buf), nullptr);
-    ceph_abort_msgf("Failed to put fsid into the %s KVS: %s", CEPH_METADATA_KVS_NAME, buf);
-  }
+  return rc && hse_err_to_errno(rc) != EEXIST ? -hse_err_to_errno(rc) : 0;
 }
 
 // Process (till hse_kvdb_txn_commit() returns) one transaction
