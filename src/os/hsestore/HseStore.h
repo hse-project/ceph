@@ -22,9 +22,12 @@
 #include <set>
 #include <vector>
 #include <optional>
-#include <hse/hse.h>
-#include <hse/hse_limits.h>
 #include <string_view>
+
+extern "C" {
+  #include <hse/hse.h>
+  #include <hse/hse_limits.h>
+}
 
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/unordered_set.hpp>
@@ -367,10 +370,8 @@ public:
     return {};
   }
 
-  void set_fsid(uuid_d u) override;
-  uuid_d get_fsid() override {
-    return fsid;
-  }
+  void set_fsid(uuid_d u) override { fsid = u; }
+  uuid_d get_fsid() override { return fsid; }
 
   uint64_t estimate_objects_overhead(uint64_t num_objects) {
     return 64;
