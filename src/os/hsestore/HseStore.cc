@@ -756,7 +756,6 @@ int HseStore::mount()
     goto err_out;
   }
   if (!fsid.parse(reinterpret_cast<char *>(fsid_buf))) {
-    printf("get: %zu %s\n", fsid_len, fsid_buf);
     dout(10) << " failed to parse fsid" << dendl;
     rc = ENOTRECOVERABLE;
     goto err_out;
@@ -906,7 +905,6 @@ int HseStore::mkfs()
   }
 
   // -1 removes NUL byte
-  printf("put: %zu %s", fsid_str.size(), fsid_str.c_str());
   rc = hse_kvs_put(_ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
     fsid_str.c_str(), fsid_str.size());
   if (rc) {
@@ -952,7 +950,7 @@ hse_err_t HseStore::write(
 void HseStore::start_one_transaction(Collection *c, Transaction *t)
 {
   struct hse_kvdb_opspec os;
-  hse_err_t rc = 0; 
+  hse_err_t rc = 0;
   HSE_KVDB_OPSPEC_INIT(&os);
   Transaction::iterator i = t->begin();
 
@@ -1299,7 +1297,7 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
 	}
 
-	dout(0) << " error " << cpp_strerror(hse_err_to_errno(rc)) << 
+	dout(0) << " error " << cpp_strerror(hse_err_to_errno(rc)) <<
 	  " not handled on operation " << op->op
 	  << " (op " << pos << ", counting from 0)" << dendl;
 	dout(0) << msg << dendl;
@@ -1771,7 +1769,7 @@ hse_err_t HseStore::kv_create_obj(
 
   klen1 = c->_coll_tkey.size();
   klen2 = o.o_ghobject_tkey.size();
-  klen3 = sizeof(hse_oid_t);;
+  klen3 = sizeof(hse_oid_t);
   auto key = std::make_unique<uint8_t[]>(klen1 + klen2 + klen3);
   memcpy(key.get(), c->_coll_tkey.c_str(), klen1);
   memcpy(key.get() + klen1, o.o_ghobject_tkey.c_str(), klen2);
