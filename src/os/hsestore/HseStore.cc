@@ -657,9 +657,8 @@ int HseStore::mount()
   hse_err_t rc = 0;
   bool fsid_found = false;
   static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
-  // 40 is stolen from BlueStore::_read_fsid()
-  uint8_t fsid_buf[40];
-  memset(fsid_buf, 0, sizeof(fsid_buf));
+  // 36 is length of UUID, +1 for NUL byte
+  uint8_t fsid_buf[37] = { 0 };
   size_t fsid_len;
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
@@ -750,13 +749,13 @@ int HseStore::mount()
 
   // -1 removed the NUL byte
   rc = hse_kvs_get(_ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
-    &fsid_found, fsid_buf, sizeof(fsid_buf), &fsid_len);
+    &fsid_found, fsid_buf, sizeof(fsid_buf) - 1, &fsid_len);
   if (rc) {
     dout(10) << " failed to get fsid" << dendl;
     goto err_out;
   }
+  ceph_assert(sizeof(fsid_buf) - 1 == fsid_len);
   if (!fsid.parse(reinterpret_cast<char *>(fsid_buf))) {
-    printf("get: %zu %s\n", fsid_len, fsid_buf);
     dout(10) << " failed to parse fsid" << dendl;
     rc = ENOTRECOVERABLE;
     goto err_out;
@@ -834,15 +833,11 @@ int HseStore::mkfs()
 {
   hse_err_t rc = 0;
   static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
-
-  if (fsid.is_zero()) {
-    fsid.generate_random();
-    dout(1) << " generated fsid " << fsid << dendl;
-  } else {
-    dout(1) << " using provided fsid " << fsid << dendl;
-  }
-
-  const std::string fsid_str = fsid.to_string();
+  bool found;
+  size_t old_fsid_len;
+  // 36 is length of UUID, +1 for NUL byte
+  uint8_t old_fsid_buf[37] = { 0 };
+  std::string fsid_str;
 
   rc = hse_kvdb_init();
   if (rc) {
@@ -906,22 +901,54 @@ int HseStore::mkfs()
   }
 
   // -1 removes NUL byte
-  printf("put: %zu %s", fsid_str.size(), fsid_str.c_str());
+  rc = hse_kvs_get(_ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+    &found, &old_fsid_buf, sizeof(old_fsid_buf), &old_fsid_len);
+  if (rc) {
+    dout(10) << " failed to read the old fsid" << dendl;
+    goto kvdb_out;
+  }
+
+  if (!found) {
+    if (fsid.is_zero()) {
+      fsid.generate_random();
+      dout(1) << " generated fsid " << fsid << dendl;
+    } else {
+      dout(1) << " using provided fsid " << fsid << dendl;
+    }
+  }
+
+  fsid_str = fsid.to_string();
+
+  ceph_assert(fsid_str.size() == (sizeof(old_fsid_buf) - 1));
+
+  // -1 because we don't want to compare NUL byte
+  if (found && memcmp(fsid_str.c_str(), old_fsid_buf, fsid_str.size())) {
+    derr << " on-disk fsid " << old_fsid_buf << " != provided " << fsid << dendl;
+    rc = EINVAL;
+    goto kvdb_out;
+  }
+
+  // -1 removes NUL byte
   rc = hse_kvs_put(_ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
     fsid_str.c_str(), fsid_str.size());
   if (rc) {
     dout(10) << " failed to persist fsid" << dendl;
-    goto kvdb_out;
+    goto kvs_out;
   }
 
+kvs_out:
+  // HSE_TODO: this will overwrite rc, best way to not do that?
   rc = hse_kvdb_kvs_close(_ceph_metadata_kvs);
   if (rc) {
     dout(10) << " failed to close ceph-metadata kvs" << dendl;
     goto kvdb_out;
   }
-
 kvdb_out:
   rc = hse_kvdb_close(_kvdb);
+  if (rc) {
+    dout(10) << " failed to close the kvdb" << dendl;
+    goto kvdb_out;
+  }
 err_out:
   hse_kvdb_fini();
 
@@ -952,7 +979,7 @@ hse_err_t HseStore::write(
 void HseStore::start_one_transaction(Collection *c, Transaction *t)
 {
   struct hse_kvdb_opspec os;
-  hse_err_t rc = 0; 
+  hse_err_t rc = 0;
   HSE_KVDB_OPSPEC_INIT(&os);
   Transaction::iterator i = t->begin();
 
@@ -1299,7 +1326,7 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
 	}
 
-	dout(0) << " error " << cpp_strerror(hse_err_to_errno(rc)) << 
+	dout(0) << " error " << cpp_strerror(hse_err_to_errno(rc)) <<
 	  " not handled on operation " << op->op
 	  << " (op " << pos << ", counting from 0)" << dendl;
 	dout(0) << msg << dendl;
@@ -1771,7 +1798,7 @@ hse_err_t HseStore::kv_create_obj(
 
   klen1 = c->_coll_tkey.size();
   klen2 = o.o_ghobject_tkey.size();
-  klen3 = sizeof(hse_oid_t);;
+  klen3 = sizeof(hse_oid_t);
   auto key = std::make_unique<uint8_t[]>(klen1 + klen2 + klen3);
   memcpy(key.get(), c->_coll_tkey.c_str(), klen1);
   memcpy(key.get() + klen1, o.o_ghobject_tkey.c_str(), klen2);
