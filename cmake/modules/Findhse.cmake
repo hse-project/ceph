@@ -27,6 +27,6 @@ find_library(HSE_LIBRARIES
     HINTS
       ENV HSE_LIB_DIR)
 
-find_package_handle_standard_args(HSE
+find_package_handle_standard_args(hse
   FOUND_VAR HSE_FOUND
   REQUIRED_VARS HSE_LIBRARIES HSE_INCLUDE_DIR)
