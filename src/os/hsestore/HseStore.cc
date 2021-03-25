@@ -754,6 +754,7 @@ int HseStore::mount()
     dout(10) << " failed to get fsid" << dendl;
     goto err_out;
   }
+  ceph_assert(sizeof(fsid_buf) - 1 == fsid_len);
   if (!fsid.parse(reinterpret_cast<char *>(fsid_buf))) {
     dout(10) << " failed to parse fsid" << dendl;
     rc = ENOTRECOVERABLE;
