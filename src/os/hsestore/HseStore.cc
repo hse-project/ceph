@@ -198,7 +198,7 @@ void Syncer::kvdb_sync(HseStore *store)
   if (!needsync)
     return;
 
-  rc = hse_kvdb_sync(store->kvdb);
+  rc = hse_kvdb_sync(store->_kvdb);
   if (rc) {
     dout(10) << " failed to sync the kvdb" << dendl;
     return;
@@ -268,7 +268,7 @@ int HseStore::write_meta(const std::string& key, const std::string& value)
 
   encoded_key[0] = 'G';
   memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
-  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
+  rc = hse_kvs_put(_ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
     value.c_str(), value.size());
   if (rc)
     dout(10) << " failed to write metadata (" << key << ", " << value << ')' << dendl;
@@ -286,7 +286,7 @@ int HseStore::read_meta(const std::string& key, std::string *value)
 
   encoded_key[0] = 'G';
   memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
-  rc = hse_kvs_get(ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
+  rc = hse_kvs_get(_ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
     &found, buf, sizeof(buf), nullptr);
   if (rc)
     dout(10) << " failed to read metadata (" << key << ')' << dendl;
@@ -356,7 +356,7 @@ int HseStore::collection_empty(CollectionHandle &c, bool *empty)
   coll_t2key(cct, c->cid, &coll_tkey);
 
   struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, coll_tkey.c_str(),
+  rc = hse_kvs_cursor_create(_collection_object_kvs, nullptr, coll_tkey.c_str(),
     coll_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while checking if collection ("
@@ -389,7 +389,6 @@ hse_err_t HseStore::remove_collection(
     coll_t cid, CollectionRef *c)
 {
   hse_err_t rc = 0;
-  std::string filt;
 
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
@@ -398,16 +397,15 @@ hse_err_t HseStore::remove_collection(
 
   l.unlock();
 
-  coll_t2key(cct, cid, &filt);
-  rc = hse_kvs_prefix_delete(collection_kvs, os, filt.c_str(), filt.size(),
+  rc = hse_kvs_prefix_delete(_collection_kvs, os, (*c)->_coll_tkey.c_str(), (*c)->_coll_tkey.size(),
     nullptr);
   if (rc) {
     dout(10) << " failed to prefix delete all data pertaining to collection (" <<
       cid << ") in collection kvs" << dendl;
     goto err_out;
   }
-  rc = hse_kvs_prefix_delete(collection_object_kvs, os, filt.c_str(),
-    filt.size(), nullptr);
+  rc = hse_kvs_prefix_delete(_collection_object_kvs, os, (*c)->_coll_tkey.c_str(),
+    (*c)->_coll_tkey.size(), nullptr);
   if (rc) {
     dout(10) << " failed to prefix delete all data pertaining to collection (" <<
       cid << ") in collection-object kvs" << dendl;
@@ -444,7 +442,7 @@ hse_err_t HseStore::split_collection(
   std::string newcid_tkey;
   coll_t2key(cct, new_cid, &newcid_tkey);
 
-  rc = hse_kvs_cursor_create(collection_object_kvs, os, oldcid_tkey.c_str(),
+  rc = hse_kvs_cursor_create(_collection_object_kvs, os, oldcid_tkey.c_str(),
     oldcid_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while splitting collection ("
@@ -481,7 +479,7 @@ hse_err_t HseStore::split_collection(
     memcpy(new_key.get() + newcid_tkey.size(), key + newcid_tkey.size(),
       key_len - newcid_tkey.size());
 
-    rc = hse_kvs_put(collection_object_kvs, os, static_cast<void *>(new_key.get()),
+    rc = hse_kvs_put(_collection_object_kvs, os, static_cast<void *>(new_key.get()),
       key_len, nullptr, 0);
     if (rc) {
       dout(10) << " failed to read from cursor while merging collections ("
@@ -489,7 +487,7 @@ hse_err_t HseStore::split_collection(
       goto err_out;
     }
 
-    rc = hse_kvs_delete(collection_object_kvs, os, key, key_len);
+    rc = hse_kvs_delete(_collection_object_kvs, os, key, key_len);
     if (rc) {
       dout(10) << " failed to data from collection while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
@@ -525,7 +523,7 @@ hse_err_t HseStore::merge_collection(
   std::string new_cid_tkey;
   coll_t2key(cct, new_cid, &new_cid_tkey);
 
-  rc = hse_kvs_cursor_create(collection_object_kvs, os, old_cid_tkey.c_str(),
+  rc = hse_kvs_cursor_create(_collection_object_kvs, os, old_cid_tkey.c_str(),
     old_cid_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while merging collections (" <<
@@ -548,7 +546,7 @@ hse_err_t HseStore::merge_collection(
     memcpy(new_key.get(), new_cid_tkey.c_str(), new_cid_tkey.size());
     memcpy(new_key.get() + ENCODED_KEY_COLL, key + ENCODED_KEY_COLL, key_len - ENCODED_KEY_COLL);
 
-    rc = hse_kvs_put(collection_object_kvs, os, static_cast<void *>(new_key.get()), key_len, nullptr, 0);
+    rc = hse_kvs_put(_collection_object_kvs, os, static_cast<void *>(new_key.get()), key_len, nullptr, 0);
     if (rc) {
       dout(10) << " failed to put while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
@@ -556,7 +554,7 @@ hse_err_t HseStore::merge_collection(
     }
   }
 
-  rc = hse_kvs_prefix_delete(collection_object_kvs, os, old_cid_tkey.c_str(),
+  rc = hse_kvs_prefix_delete(_collection_object_kvs, os, old_cid_tkey.c_str(),
     old_cid_tkey.size(), nullptr);
   if (rc) {
     dout(10) << " failed to prefix delete data from collection while merging collections ("
@@ -633,51 +631,51 @@ int HseStore::mount()
     goto err_out;
   }
 
-  rc = hse_kvdb_open(kvdb_name.data(), nullptr, &kvdb);
+  rc = hse_kvdb_open(kvdb_name.data(), nullptr, &_kvdb);
   if (rc) {
     dout(10) << " failed to open the kvdb" << dendl;
     goto err_out;
   }
 
   /* HSE_TODO: how to handle error logic here */
-  rc = hse_kvdb_kvs_open(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr, &ceph_metadata_kvs);
+  rc = hse_kvdb_kvs_open(_kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr, &_ceph_metadata_kvs);
   if (rc) {
     dout(10) << " failed to open the ceph-metadata kvs" << dendl;
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, COLLECTION_KVS_NAME.data(), nullptr, &collection_kvs);
+  rc = hse_kvdb_kvs_open(_kvdb, COLLECTION_KVS_NAME.data(), nullptr, &_collection_kvs);
   if (rc) {
     dout(10) << " failed to open the collection kvs" << dendl;
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr, &collection_object_kvs);
+  rc = hse_kvdb_kvs_open(_kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr, &_collection_object_kvs);
   if (rc) {
     dout(10) << " failed to open the collection-object kvs" << dendl;
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr, &object_data_kvs);
+  rc = hse_kvdb_kvs_open(_kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr, &_object_data_kvs);
   if (rc) {
     dout(10) << " failed to open the object-data kvs" << dendl;
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr, &object_xattr_kvs);
+  rc = hse_kvdb_kvs_open(_kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr, &_object_xattr_kvs);
   if (rc) {
     dout(10) << " failed to open the object-xattr kvs" << dendl;
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_open(kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr, &object_omap_kvs);
+  rc = hse_kvdb_kvs_open(_kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr, &_object_omap_kvs);
   if (rc) {
     dout(10) << " failed to open the object-omap kvs" << dendl;
     goto err_out;
   }
 
   struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(collection_kvs, nullptr, nullptr, 0, &cursor);
+  rc = hse_kvs_cursor_create(_collection_kvs, nullptr, nullptr, 0, &cursor);
   if (rc) {
     dout(10) << " failed to create a cursor for populating the in-memory collection map" << dendl;
     goto err_out;
@@ -710,7 +708,7 @@ int HseStore::mount()
   }
 
   // -1 removed the NUL byte
-  rc = hse_kvs_get(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+  rc = hse_kvs_get(_ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
     &fsid_found, fsid_buf, sizeof(fsid_buf), nullptr);
   if (rc) {
     dout(10) << " failed to get fsid" << dendl;
@@ -732,54 +730,54 @@ int HseStore::umount()
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
 
   /* HSE_TODO: how to handle error logic here */
-  rc = hse_kvdb_kvs_close(ceph_metadata_kvs);
+  rc = hse_kvdb_kvs_close(_ceph_metadata_kvs);
   if (rc) {
     dout(10) << " failed to close the ceph-metadata kvs" << dendl;
     goto err_out;
   }
-  ceph_metadata_kvs = nullptr;
+  _ceph_metadata_kvs = nullptr;
 
-  rc = hse_kvdb_kvs_close(collection_kvs);
+  rc = hse_kvdb_kvs_close(_collection_kvs);
   if (rc) {
     dout(10) << " failed to close the collection kvs" << dendl;
     goto err_out;
   }
-  collection_kvs = nullptr;
+  _collection_kvs = nullptr;
 
-  rc = hse_kvdb_kvs_close(collection_object_kvs);
+  rc = hse_kvdb_kvs_close(_collection_object_kvs);
   if (rc) {
     dout(10) << " failed to close the collection-object kvs" << dendl;
     goto err_out;
   }
-  collection_object_kvs = nullptr;
+  _collection_object_kvs = nullptr;
 
-  rc = hse_kvdb_kvs_close(object_data_kvs);
+  rc = hse_kvdb_kvs_close(_object_data_kvs);
   if (rc) {
     dout(10) << " failed to close the object-data kvs" << dendl;
     goto err_out;
   }
-  object_data_kvs = nullptr;
+  _object_data_kvs = nullptr;
 
-  rc = hse_kvdb_kvs_close(object_xattr_kvs);
+  rc = hse_kvdb_kvs_close(_object_xattr_kvs);
   if (rc) {
     dout(10) << " failed to close the object-xattr kvs" << dendl;
     goto err_out;
   }
-  object_xattr_kvs = nullptr;
+  _object_xattr_kvs = nullptr;
 
-  rc = hse_kvdb_kvs_close(object_omap_kvs);
+  rc = hse_kvdb_kvs_close(_object_omap_kvs);
   if (rc) {
     dout(10) << " failed to close the object-omap kvs" << dendl;
     goto err_out;
   }
-  object_omap_kvs = nullptr;
+  _object_omap_kvs = nullptr;
 
-  rc = hse_kvdb_close(kvdb);
+  rc = hse_kvdb_close(_kvdb);
   if (rc) {
     dout(10) << " failed to close the kvdb" << dendl;
     goto err_out;
   }
-  kvdb = nullptr;
+  _kvdb = nullptr;
 
   new_coll_map.clear();
   coll_map.clear();
@@ -806,50 +804,50 @@ int HseStore::mkfs()
     goto err_out;
   }
 
-  rc = hse_kvdb_open(kvdb_name.data(), nullptr, &kvdb);
+  rc = hse_kvdb_open(kvdb_name.data(), nullptr, &_kvdb);
   if (rc) {
     dout(10) << " failed to open the kvdb" << dendl;
     goto err_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr);
   if (rc) {
     dout(10) << " failed to make the ceph-metadata kvs" << dendl;
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, COLLECTION_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, COLLECTION_KVS_NAME.data(), nullptr);
   if (rc) {
     dout(10) << " failed to make the collection kvs" << dendl;
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr);
   if (rc) {
     dout(10) << " failed to make the collection-object kvs" << dendl;
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr);
   if (rc) {
     dout(10) << " failed to make the object-data kvs" << dendl;
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr);
   if (rc) {
     dout(10) << " failed to make the object-xattr kvs" << dendl;
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr);
   if (rc) {
     dout(10) << " failed to make the object-omap kvs" << dendl;
     goto kvdb_out;
   }
 
 kvdb_out:
-  rc = hse_kvdb_close(kvdb);
+  rc = hse_kvdb_close(_kvdb);
 err_out:
   hse_kvdb_fini();
 
@@ -895,7 +893,7 @@ void HseStore::set_fsid(uuid_d u)
   static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
 
   // -1 removes NUL byte
-  rc = hse_kvs_put(ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
+  rc = hse_kvs_put(_ceph_metadata_kvs, nullptr, fsid_key, sizeof(fsid_key) - 1,
     u.bytes(), u.uuid.size());
 
   fsid = u;
@@ -920,9 +918,6 @@ hse_err_t HseStore::write(
   dout(15) << __func__ << " " << c->cid << " " << *o.o_oid
 	   << " " << offset << "~" << length
 	   << dendl;
-  // _assign_nid(txc, o);
-  // int r = _do_write(txc, o, offset, length, bl, fadvise_flags);
-  // txc->write_onode(o);
 
   dout(10) << __func__ << " " << c->cid << " " << *o.o_oid
 	   << " " << offset << "~" << length
@@ -941,10 +936,10 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
   //
   // Start a hse transaction.
   //
-  os.kop_txn = hse_kvdb_txn_alloc(kvdb);
-  rc = hse_kvdb_txn_begin(kvdb, os.kop_txn);
+  os.kop_txn = hse_kvdb_txn_alloc(_kvdb);
+  rc = hse_kvdb_txn_begin(_kvdb, os.kop_txn);
   if (rc) {
-    hse_kvdb_txn_free(kvdb, os.kop_txn);
+    hse_kvdb_txn_free(_kvdb, os.kop_txn);
     dout(10) << __func__ << " failed to begin transaction " << c->cid << dendl;
     return;
   }
@@ -1281,8 +1276,9 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
 	}
 
-	dout(0) << " error " << cpp_strerror(rc) << " not handled on operation " << op->op
-		<< " (op " << pos << ", counting from 0)" << dendl;
+	dout(0) << " error " << cpp_strerror(hse_err_to_errno(rc)) << 
+	  " not handled on operation " << op->op
+	  << " (op " << pos << ", counting from 0)" << dendl;
 	dout(0) << msg << dendl;
 	dout(0) << " transaction dump:\n";
 	JSONFormatter f(true);
@@ -1300,15 +1296,15 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
   // Commit the transaction in hse
   //
   if (rc) {
-      hse_kvdb_txn_abort(kvdb, os.kop_txn);
+      hse_kvdb_txn_abort(_kvdb, os.kop_txn);
       dout(10)  << __func__ << " transaction aborted" << dendl;
   } else {
-    rc = hse_kvdb_txn_commit(kvdb, os.kop_txn);
+    rc = hse_kvdb_txn_commit(_kvdb, os.kop_txn);
     if (rc) {
       dout(10)  << __func__ << " failed to commit transaction" << dendl;
     }
   }
-  hse_kvdb_txn_free(kvdb, os.kop_txn);
+  hse_kvdb_txn_free(_kvdb, os.kop_txn);
 }
 
 // some things we encode in binary (as le32 or le64); print the
@@ -1556,7 +1552,7 @@ static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string 
 }
 
 /*
- * Get the hse_oid from the ghobject_t looking in collection_object_kvs
+ * Get the hse_oid from the ghobject_t looking in _collection_object_kvs
  */
 hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid, bool& found,
     HseStore::hse_oid_t& hse_oid)
@@ -1583,7 +1579,7 @@ hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid,
   memset(filt_max.get() + filt_min_len, 0xFF, sizeof(HseStore::hse_oid_t));
 
   struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(collection_object_kvs, nullptr, coll_tkey.c_str(), coll_tkey.size(), &cursor);
+  rc = hse_kvs_cursor_create(_collection_object_kvs, nullptr, coll_tkey.c_str(), coll_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor when check existence of object ("
       << oid << ") with collection (" << cid << ')' << dendl;
@@ -1748,7 +1744,7 @@ hse_err_t HseStore::kv_create_obj(
   size_t klen3;
   hse_err_t rc;
 
-  o.o_hse_oid = this->_hse_oid++;
+  o.o_hse_oid = this->_next_hse_oid++;
 
   klen1 = c->_coll_tkey.size();
   klen2 = o.o_ghobject_tkey.size();
@@ -1758,12 +1754,12 @@ hse_err_t HseStore::kv_create_obj(
   memcpy(key.get() + klen1, o.o_ghobject_tkey.c_str(), klen2);
   memcpy(key.get() + klen1 + klen2, &o.o_hse_oid, klen3);
 
-  rc = hse_kvs_put(collection_object_kvs, os, static_cast<void *>(key.get()),
+  rc = hse_kvs_put(_collection_object_kvs, os, static_cast<void *>(key.get()),
     klen1 + klen2 + klen3, nullptr, 0);
   if (rc) {
     // ignoring rc from abort since we don't want to mask original error
-    hse_kvdb_txn_abort(kvdb, os->kop_txn);
-    dout(10) << __func__ << " failed to put in collection_object_kvs" << dendl;
+    hse_kvdb_txn_abort(_kvdb, os->kop_txn);
+    dout(10) << __func__ << " failed to put in _collection_object_kvs" << dendl;
   }
   o.o_exists = true;
   return rc;

@@ -135,7 +135,7 @@ class HseStore : public ObjectStore {
   Syncer *_syncer;
   //
   // Next hse_oid to assign to a new Ceph object.
-  std::atomic<uint64_t> _hse_oid;
+  std::atomic<uint64_t> _next_hse_oid;
 
   // Information about one object referenced by a Ceph transaction.
   // The lifetime of an Onode is the same as its transaction.
@@ -275,7 +275,7 @@ public:
       ThreadPool::TPHandle *handle = NULL) override;
 
   bool test_mount_in_use() override {
-    return kvdb != nullptr;
+    return _kvdb != nullptr;
   }
   int mount() override;
   int umount() override;
@@ -429,13 +429,13 @@ private:
   std::string_view kvdb_name;
   uuid_d fsid;
 
-  struct hse_kvdb *kvdb;
-  struct hse_kvs *ceph_metadata_kvs;
-  struct hse_kvs *collection_kvs;
-  struct hse_kvs *collection_object_kvs;
-  struct hse_kvs *object_data_kvs;
-  struct hse_kvs *object_xattr_kvs;
-  struct hse_kvs *object_omap_kvs;
+  struct hse_kvdb *_kvdb;
+  struct hse_kvs *_ceph_metadata_kvs;
+  struct hse_kvs *_collection_kvs;
+  struct hse_kvs *_collection_object_kvs;
+  struct hse_kvs *_object_data_kvs;
+  struct hse_kvs *_object_xattr_kvs;
+  struct hse_kvs *_object_omap_kvs;
 
   HseStore::CollectionRef get_collection(coll_t cid);
 
