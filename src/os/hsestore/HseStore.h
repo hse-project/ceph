@@ -48,6 +48,11 @@ extern "C" {
 #include "include/uuid.h"
 
 
+// Data block in KVS object_data_kvs is 2^DATA_BLOCK_SHIFT
+#define DATA_BLOCK_SHIFT 12
+#define DATA_BLOCK_LEN (1ULL << DATA_BLOCK_SHIFT)
+#define OBJECT_DATA_KEY_LEN (sizeof(hse_oid_t) + sizeof(uint32_t))
+
 class WaitCond {
   boost::condition_variable   _done_cond;
   boost::mutex                _done_mutex;
@@ -145,7 +150,7 @@ class HseStore : public ObjectStore {
   // The goal of an Onode is to avoid doing the same processing several times in a transaction.
   // For example:
   // - recomputing ghobject_t2key for each operation of the transaction that uses a same object.
-  // - redoing the lookup ghobject_t2key -> hse_oid_t for each operation of the transaction 
+  // - redoing the lookup ghobject_t2key -> hse_oid_t for each operation of the transaction
   //   that uses a same object.
   //
   struct Onode {
@@ -160,7 +165,7 @@ class HseStore : public ObjectStore {
     hse_oid_t o_hse_oid;
 
     // Object not yet in KVS collection_object_kvs, but the operation will create the object and
-    // put it in the KVS. 
+    // put it in the KVS.
     // It is a new object.
     bool o_dirty;
 
@@ -250,11 +255,21 @@ class HseStore : public ObjectStore {
   hse_err_t ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid, bool& found,
     hse_oid_t& hse_oid);
 
+  void offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset, std::string *key);
+
+  hse_err_t kv_write_data(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
+    uint64_t offset, size_t length, bufferlist& bl);
   hse_err_t write(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, uint64_t offset,
     size_t length, bufferlist& bl, uint32_t fadvise_flags);
+  hse_err_t kv_read_data(struct hse_kvdb_opspec *os, Onode& o, uint64_t offset, size_t length,
+    bufferlist& bl);
 
   hse_err_t kv_create_obj(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o);
-
+  uint32_t object_data_key2block_nb(std::string& object_data_key);
+  uint32_t block_offset(uint64_t offset);
+  uint32_t end_block_length(uint64_t offset, size_t length);
+  uint32_t append_zero_blocks_in_bl(int32_t first_block_nb, int32_t last_block_nb, bufferlist& bl,
+    uint32_t first_offset, uint32_t last_length);
 
 
 public:
@@ -343,9 +358,7 @@ public:
     size_t len,
     ceph::buffer::list &bl,
     uint32_t op_flags = 0
-  ) override {
-    return -EOPNOTSUPP;
-  }
+  ) override;
 
   int fiemap(CollectionHandle &c, const ghobject_t &oid,
       uint64_t offset, size_t len, ceph::buffer::list &bl) override {
@@ -453,7 +466,7 @@ class Syncer {
   // Work queue used by the syncer, contains sync requests (flush_commit())
   boost::asio::io_service _sync_wq;
 
-  boost::asio::io_service::work _work; 
+  boost::asio::io_service::work _work;
   boost::asio::deadline_timer _timer;
 
   // Thread group for the thread running the _sync_wq
