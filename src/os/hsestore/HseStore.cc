@@ -17,6 +17,7 @@
 #include <string_view>
 #include <climits>
 #include <cstring>
+#include <sys/mman.h>
 
 extern "C" {
   #include <hse/hse.h>
@@ -50,6 +51,18 @@ static constexpr std::string_view COLLECTION_OBJECT_KVS_NAME = "collection-objec
 static constexpr std::string_view OBJECT_DATA_KVS_NAME = "object-data";
 static constexpr std::string_view OBJECT_XATTR_KVS_NAME = "object-xattr";
 static constexpr std::string_view OBJECT_OMAP_KVS_NAME = "object-omap";
+
+// Buffer used by Ceph write data operations.
+// If the write operation requires a read, his buffer is also used for the read.
+alignas(DATA_BLOCK_LEN) thread_local uint8_t odata_buf[DATA_BLOCK_LEN];
+
+// Buffer used for Ceph read data operations.
+// It is always zero (never changed). It is used to return zeroes to Ceph without doing a copy.
+// This same buffer can be usd in parallel by different read operations across transactions
+// and collections.
+// It is assumed that Ceph, (that sees this buffer only in the result of a read operations),
+// is not changing its content.
+alignas(DATA_BLOCK_LEN) uint8_t zbuf[DATA_BLOCK_LEN] = {0};
 
 static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string *key);
 static int key2ghobject_t(const std::string_view key, ghobject_t &oid);
@@ -290,6 +303,8 @@ HseStore::HseStore(CephContext *cct, const std::string& path)
     finisher(cct),
     kvdb_name(cct->_conf->hsestore_kvdb)
 {
+  // The zero page should not be changed.
+  mprotect(zbuf, sizeof(zbuf), PROT_READ);
 }
 
 HseStore::~HseStore()
@@ -955,6 +970,434 @@ err_out:
   return rc && hse_err_to_errno(rc) != EEXIST ? -hse_err_to_errno(rc) : 0;
 }
 
+/*
+ * Compute a key to use in the KVS object_data_kvs
+ * The key is composed of the hse_oid_t + data block number.
+ */
+void HseStore::offset2object_data_key(hse_oid_t &hse_oid, uint64_t offset, std::string *key)
+{
+  uint32_t data_block_number;
+
+  key->clear();
+
+  _key_encode_u64(hse_oid, key);
+
+  data_block_number = offset >> DATA_BLOCK_SHIFT;
+  // Must be always MSB first to sort correctly.
+  _key_encode_u32(data_block_number, key);
+
+  ceph_assert(key->length() == OBJECT_DATA_KEY_LEN);
+}
+
+// From a key (hse_oid+encoded block number) used in kvs ~_object_data_kvs
+// return the block number.
+uint32_t HseStore::object_data_key2block_nb(
+    std::string& object_data_key)
+{
+  uint32_t block_nb;
+
+  _key_decode_u32(object_data_key.c_str() + sizeof(hse_oid_t), &block_nb);
+  return block_nb;
+}
+
+// Append buffers (each block sized and zero filled) in the buffer list "bl".
+uint32_t HseStore::append_zero_blocks_in_bl(
+    int32_t first_block_nb,
+    int32_t last_block_nb,
+    bufferlist& bl,
+    uint32_t first_offset,
+    uint32_t last_length)
+{
+  int32_t block_nb;
+  uint32_t block_cnt;
+
+  for (block_nb = first_block_nb, block_cnt = 0;
+    block_nb < last_block_nb; block_nb++, block_cnt++) {
+
+    bufferptr ptr(buffer::create_static(DATA_BLOCK_LEN, (char *)zbuf));
+    if (block_cnt == 0) {
+      // First zero block
+      ptr.set_offset(first_offset);
+    } else if (block_nb == last_block_nb - 1) {
+      // Last zero block
+      ptr.set_length(last_length);
+    }
+    bl.append(ptr);
+  }
+  return block_cnt;
+}
+
+uint32_t HseStore::block_offset(uint64_t offset)
+{
+  return offset & ~(DATA_BLOCK_LEN -1);
+}
+uint32_t HseStore::end_block_length(uint64_t offset, size_t length)
+{
+  return (offset + length) & ~(DATA_BLOCK_LEN -1);
+}
+
+hse_err_t HseStore::kv_read_data(
+    struct hse_kvdb_opspec *os,
+    Onode& o,
+    uint64_t offset,
+    size_t length,
+    bufferlist& bl)
+{
+  hse_err_t rc = 0;
+  std::string start_block_key;
+  int32_t prev_cursor_block_nb;
+  std::string cursor_block_key;
+  uint64_t start_block_offset;
+  uint64_t end_block_offset;
+  bool found;
+  const void *val;
+  size_t val_len;
+  const void *seek_found;
+  size_t seek_found_len;
+  size_t cursor_block_key_len;
+  int32_t start_block_nb;
+  int32_t end_block_nb;
+  uint32_t start_block_rel_offset;
+  uint32_t end_block_rel_length;
+
+
+  dout(20) << __func__ << " " << offset << "~" << length << dendl;
+
+  // To avoid data copy:
+  // - free whatever buffers present in bl (done by bl.clear())
+  // - this function will allocate adequate buffers to avoid data copy and these
+  //   buffers are hooked up to bl.
+  bl.clear();
+
+  start_block_key.reserve(sizeof(hse_oid_t) + sizeof(uint32_t));
+  cursor_block_key.reserve(sizeof(hse_oid_t) + sizeof(uint32_t));
+
+  start_block_offset = block_offset(offset);
+  start_block_rel_offset = offset - start_block_offset;
+  offset2object_data_key(o.o_hse_oid, start_block_offset, &start_block_key);
+  start_block_nb = start_block_offset >> DATA_BLOCK_SHIFT;
+
+  end_block_offset = block_offset(offset + length);
+  end_block_rel_length = end_block_length(offset, length);
+  end_block_nb = end_block_offset >> DATA_BLOCK_SHIFT;
+
+  if (start_block_nb == end_block_nb) {
+
+    //
+    // The read in contained in one block, do not use a cursor.
+    //
+
+    // Allocate a full data block.
+    bufferptr ptr(buffer::create_page_aligned(DATA_BLOCK_LEN));
+
+    rc = hse_kvs_get(_object_data_kvs, os, start_block_key.c_str(), start_block_key.length(),
+      &found, ptr.c_str(), DATA_BLOCK_LEN, &val_len);
+    if (rc) {
+      dout(10) << __func__ << " failed to get object data block " << dendl;
+      return rc;
+    }
+
+
+    if (found) {
+      ceph_assert(val_len == DATA_BLOCK_LEN);
+      ptr.set_offset(start_block_rel_offset);
+      ptr.set_length(end_block_rel_length);
+      bl.append(ptr);
+    } else {
+      // Return zeroes. Use our zeroed buffer zbuf.
+      // Because create_static is used zbuf will not be freed by ceph
+      bufferptr ptr1(buffer::create_static(DATA_BLOCK_LEN, (char *)zbuf));
+      ptr1.set_offset(start_block_rel_offset);
+      ptr1.set_length(end_block_rel_length);
+      bl.append(ptr1);
+    }
+    return rc;
+  }
+
+
+  //
+  // Several blocks need to be read, use a cursor.
+  //
+
+
+  //
+  // Create a cursor with the hse oid as filter and that can see the result of the
+  // previous write operations from the current Ceph transaction.
+  //
+  struct hse_kvs_cursor *cursor;
+  os->kop_flags = HSE_KVDB_KOP_FLAG_BIND_TXN;
+  rc = hse_kvs_cursor_create(_object_data_kvs, os, (void *)(&o.o_hse_oid),
+    sizeof(hse_oid_t), &cursor);
+  if (rc) {
+    dout(10) << __func__ << " failed to create a cursor data" << dendl;
+    return rc;
+  }
+
+  //
+  // Go to the first block. It may not exist.
+  //
+  rc = hse_kvs_cursor_seek(cursor, os, start_block_key.c_str(), start_block_key.length(),
+    &seek_found, &seek_found_len);
+  if (rc) {
+    dout(10) << __func__ << " failed to seek to start block" << dendl;
+    goto end;
+  }
+
+  if (!seek_found_len) {
+    //
+    // There is no data to be read (at start offset and beyond). Return all zero.
+    //
+    append_zero_blocks_in_bl(start_block_nb,
+      end_block_nb + 1, bl, start_block_rel_offset, end_block_rel_length);
+
+    goto end;
+  }
+
+  ceph_assert(seek_found_len == OBJECT_DATA_KEY_LEN);
+  prev_cursor_block_nb = start_block_nb - 1; // May be negative.
+
+  while (true) {
+    bool eof;
+    uint32_t offset_in_block;
+    uint32_t length_in_block;
+    int32_t cursor_block_nb;
+
+    rc = hse_kvs_cursor_read(cursor, os, reinterpret_cast<const void **>(&cursor_block_key),
+      &cursor_block_key_len, reinterpret_cast<const void **>(&val), &val_len, &eof);
+    if (rc) {
+      dout(10) << " failed to read cursor for populating initial coll_map" << dendl;
+      goto end;
+    }
+    if (eof) {
+      cursor_block_nb = INT_MAX;
+    } else {
+      ceph_assert(cursor_block_key_len == OBJECT_DATA_KEY_LEN);
+      ceph_assert(val_len == DATA_BLOCK_LEN);
+      cursor_block_nb = object_data_key2block_nb(cursor_block_key);
+    }
+    if (cursor_block_nb > end_block_nb) {
+      // Adjust cursor_block_nb to add the correct number of zero buffers/pages
+      // in the call to append_zero_blocks_in_bl() below.
+      cursor_block_nb = end_block_nb + 1;
+    }
+
+
+    //
+    // Add zeroed buffers for the blocks before the cursor position.
+    //
+    offset_in_block = 0;
+    if (prev_cursor_block_nb + 1 == start_block_nb) {
+      //
+      offset_in_block = start_block_rel_offset;
+    }
+    length_in_block = DATA_BLOCK_LEN;
+    if (cursor_block_nb == end_block_nb + 1) {
+      // Adjust length in the last buffer.
+      length_in_block = end_block_rel_length;
+    }
+    append_zero_blocks_in_bl(prev_cursor_block_nb + 1,
+      cursor_block_nb, bl, offset_in_block, length_in_block);
+
+
+
+    if (cursor_block_nb > end_block_nb) {
+      break;
+    }
+
+    //
+    // Attach the data of the block at cursor position to the buffer list bl
+    //
+    bufferptr ptr(buffer::create_static(DATA_BLOCK_LEN, (char *)val));
+    if (cursor_block_nb == start_block_nb) {
+      // This is the first block returned.
+      // Adjust it start offset.
+      ptr.set_offset(start_block_rel_offset);
+    }
+    if (cursor_block_nb == end_block_nb) {
+      // This is the last block returned.
+      // Adjust the length in the buffer.
+      ptr.set_length(end_block_rel_length);
+    }
+    bl.append(ptr);
+
+
+    prev_cursor_block_nb = cursor_block_nb;
+  }
+
+end:
+  if (!rc) {
+    ceph_assert(bl.length() == length);
+  }
+  if (hse_kvs_cursor_destroy(cursor)) {
+    dout(10) << __func__ << " failed to destroy cursor" << dendl;
+  }
+
+  return rc;
+}
+
+int HseStore::read(
+     CollectionHandle &ch,
+     const ghobject_t& oid,
+     uint64_t offset,
+     size_t len,
+     ceph::buffer::list& bl,
+     uint32_t op_flags)
+{
+  hse_err_t rc = 0;
+  struct hse_kvdb_opspec os;
+  HSE_KVDB_OPSPEC_INIT(&os);
+  Onode o;
+
+  Collection *c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, true);
+  if (!o.o_exists) {
+    return -ENOENT;
+  }
+
+  //
+  // Start a hse transaction.
+  //
+  os.kop_txn = hse_kvdb_txn_alloc(_kvdb);
+  rc = hse_kvdb_txn_begin(_kvdb, os.kop_txn);
+  if (rc) {
+    dout(10) << __func__ << " failed to begin transaction " << c->cid << dendl;
+    goto end;
+  }
+
+  rc = HseStore::kv_read_data(&os, o, offset, len, bl);
+
+end:
+  hse_kvdb_txn_free(_kvdb, os.kop_txn);
+  return -hse_err_to_errno(rc);
+}
+
+/*
+ * Try to avoid a data copy by passing to HSE (when possible) a pointer into one of the buffer
+ * of the input Ceph bufferlist.
+ */
+hse_err_t HseStore::kv_write_data(
+  struct hse_kvdb_opspec *os,
+  CollectionRef& c,
+  Onode& o,
+  uint64_t offset, size_t length,
+  bufferlist& bl)
+{
+  hse_err_t rc = 0;
+  std::string object_data_key;
+  object_data_key.reserve(sizeof(hse_oid_t) + sizeof(uint32_t));
+  uint64_t block_offset;
+  uint64_t start_offset = offset;
+  uint64_t end_offset = offset + length;
+  bufferlist::iterator i(&bl);
+  uint32_t to_copy_in_block;
+
+  dout(15) << __func__ << " " << c->cid << " " << *o.o_oid
+	   << " " << offset << "~" << length
+	   << dendl;
+
+  // Loop on the data blocks.
+  for (; length > 0; offset += to_copy_in_block, length -= to_copy_in_block) {
+    bool merge = false;
+    uint32_t block_wr_offset = 0; // Offset from beginning of block
+    size_t val_len;
+    uint8_t *wb;
+    uint8_t *ceph_ptr;
+
+    to_copy_in_block = DATA_BLOCK_LEN;
+    block_offset = offset & ~(DATA_BLOCK_LEN -1);
+    offset2object_data_key(o.o_hse_oid, block_offset, &object_data_key);
+
+    if (start_offset > block_offset) {
+      // The data start is in the middle of the first block.
+      merge = true;
+      block_wr_offset = start_offset - block_offset;
+      to_copy_in_block -= block_wr_offset;
+    }
+    if (end_offset < block_offset + DATA_BLOCK_LEN) {
+      // The data end is in the middle of the last block.
+      merge = true;
+      to_copy_in_block -= block_offset + DATA_BLOCK_LEN - end_offset;
+    }
+    ceph_assert(to_copy_in_block);
+
+    if (merge) {
+      bool found;
+
+      // A merge need to be done.
+
+      //
+      // Read the block.
+      //
+
+      rc = hse_kvs_get(_object_data_kvs, os, object_data_key.c_str(), object_data_key.length(),
+	  &found, odata_buf, DATA_BLOCK_LEN, &val_len);
+      if (rc) {
+        dout(10) << __func__ << " failed to get object data block " << c->cid << dendl;
+        goto end;
+      }
+
+      if (found) {
+	ceph_assert(val_len == DATA_BLOCK_LEN);
+	//
+	// Merge new data with old data read in the odata_buf.
+	//
+	i.copy(to_copy_in_block, (char *)odata_buf + block_wr_offset);
+      } else {
+	uint32_t copied;
+
+	// Block doesn't exist yet, no need to merge, pad with zeroes.
+	if (block_wr_offset)
+	  memset(odata_buf, 0, block_wr_offset);
+	i.copy(to_copy_in_block, (char *)odata_buf + block_wr_offset);
+	copied = block_wr_offset + to_copy_in_block;
+	if (copied < DATA_BLOCK_LEN)
+	  memset(odata_buf + copied, 0, DATA_BLOCK_LEN - copied);
+      }
+      wb = odata_buf;
+
+    } else {
+      size_t got;
+
+      //
+      // No merge needed
+      //
+
+      ceph_assert(to_copy_in_block == DATA_BLOCK_LEN);
+      ceph_assert(block_wr_offset == 0);
+
+      //
+      // To avoid a copy, try to get a pointer in the buffer list.
+      //
+      got = i.get_ptr_and_advance(DATA_BLOCK_LEN, (const char**)&ceph_ptr);
+      ceph_assert(got <= DATA_BLOCK_LEN);
+      if (got == DATA_BLOCK_LEN) {
+	// No data copy!
+	wb = ceph_ptr;
+      } else {
+	// Ceph buffer not big enough we need to do a copy
+	memcpy(odata_buf, ceph_ptr, got);
+	i.copy(DATA_BLOCK_LEN - got, (char *)odata_buf + got);
+	wb = odata_buf;
+      }
+    }
+
+
+    // Write the block
+    rc = hse_kvs_put(_object_data_kvs, os, static_cast<const void *>(object_data_key.c_str()),
+      object_data_key.length(), wb, DATA_BLOCK_LEN);
+    if (rc) {
+      dout(10) << __func__ << " failed to get object data block " << c->cid << dendl;
+      goto end;
+    }
+  }
+
+end:
+  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid
+	   << " " << start_offset << "~" << end_offset - start_offset
+	   << " = " << rc << dendl;
+  return rc;
+}
+
 hse_err_t HseStore::write(
   struct hse_kvdb_opspec *os,
   CollectionRef& c,
@@ -963,17 +1406,19 @@ hse_err_t HseStore::write(
   bufferlist& bl,
   uint32_t fadvise_flags)
 {
-  hse_err_t rc = 0;
+  hse_err_t rc;
 
-  dout(15) << __func__ << " " << c->cid << " " << *o.o_oid
-	   << " " << offset << "~" << length
-	   << dendl;
+  ceph_assert(o.o_gotten);
 
-  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid
-	   << " " << offset << "~" << length
-	   << " = " << rc << dendl;
+  if (!o.o_exists) {
+    rc = kv_create_obj(os, c, o);
+    if (rc)
+      return rc;
+  }
+  rc = kv_write_data(os, c, o, offset, length, bl);
   return rc;
 }
+
 
 // Process (till hse_kvdb_txn_commit() returns) one transaction
 void HseStore::start_one_transaction(Collection *c, Transaction *t)
@@ -1118,7 +1563,6 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       rc = kv_create_obj(&os, c, o);
       break;
 
-#if 0
     case Transaction::OP_WRITE:
       {
         uint64_t off = op->off;
@@ -1126,10 +1570,11 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	uint32_t fadvise_flags = i.get_fadvise_flags();
         bufferlist bl;
         i.decode_bl(bl);
-	r = write(c, o, off, len, bl, fadvise_flags);
+	rc = write(&os, c, o, off, len, bl, fadvise_flags);
       }
       break;
 
+#if 0
     case Transaction::OP_ZERO:
       {
         uint64_t off = op->off;
@@ -1794,6 +2239,8 @@ hse_err_t HseStore::kv_create_obj(
   size_t klen3;
   hse_err_t rc;
 
+  ceph_assert(!o.o_exists);
+
   o.o_hse_oid = this->_next_hse_oid++;
 
   klen1 = c->_coll_tkey.size();
@@ -1807,9 +2254,8 @@ hse_err_t HseStore::kv_create_obj(
   rc = hse_kvs_put(_collection_object_kvs, os, static_cast<void *>(key.get()),
     klen1 + klen2 + klen3, nullptr, 0);
   if (rc) {
-    // ignoring rc from abort since we don't want to mask original error
-    hse_kvdb_txn_abort(_kvdb, os->kop_txn);
     dout(10) << __func__ << " failed to put in _collection_object_kvs" << dendl;
+    return rc;
   }
   o.o_exists = true;
   return rc;
