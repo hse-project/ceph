@@ -53,7 +53,7 @@ static constexpr std::string_view OBJECT_XATTR_KVS_NAME = "object-xattr";
 static constexpr std::string_view OBJECT_OMAP_KVS_NAME = "object-omap";
 
 // Buffer used by Ceph write data operations.
-// If the write operation requires a read, his buffer is also used for the read.
+// If the write operation requires a read, this buffer is also used for the read.
 alignas(DATA_BLOCK_LEN) thread_local uint8_t odata_buf[DATA_BLOCK_LEN];
 
 // Buffer used for Ceph read data operations.
@@ -974,7 +974,8 @@ err_out:
  * Compute a key to use in the KVS object_data_kvs
  * The key is composed of the hse_oid_t + data block number.
  */
-void HseStore::offset2object_data_key(hse_oid_t &hse_oid, uint64_t offset, std::string *key)
+void HseStore::offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset,
+    std::string *key)
 {
   uint32_t data_block_number;
 
@@ -989,8 +990,8 @@ void HseStore::offset2object_data_key(hse_oid_t &hse_oid, uint64_t offset, std::
   ceph_assert(key->length() == OBJECT_DATA_KEY_LEN);
 }
 
-// From a key (hse_oid+encoded block number) used in kvs ~_object_data_kvs
-// return the block number.
+// Return the block number from the key used in kvs _object_data_kvs (hse_oid +
+// encoded block number)
 uint32_t HseStore::object_data_key2block_nb(
     std::string& object_data_key)
 {
@@ -1165,7 +1166,7 @@ hse_err_t HseStore::kv_read_data(
     rc = hse_kvs_cursor_read(cursor, os, reinterpret_cast<const void **>(&cursor_block_key),
       &cursor_block_key_len, reinterpret_cast<const void **>(&val), &val_len, &eof);
     if (rc) {
-      dout(10) << " failed to read cursor for populating initial coll_map" << dendl;
+      dout(10) << __func__ << " cursor read failed" << dendl;
       goto end;
     }
     if (eof) {
@@ -1304,7 +1305,7 @@ hse_err_t HseStore::kv_write_data(
     uint8_t *ceph_ptr;
 
     to_copy_in_block = DATA_BLOCK_LEN;
-    block_offset = offset & ~(DATA_BLOCK_LEN -1);
+    block_offset = HseStore::block_offset(offset);
     offset2object_data_key(o.o_hse_oid, block_offset, &object_data_key);
 
     if (start_offset > block_offset) {
@@ -1944,12 +1945,12 @@ static int decode_escaped(const char *p, string *out)
       *ptr++ = *p++;
     }
     if (ptr > max) {
-       out->append((char *)buff, (char *)(ptr-buff));
+       out->append((char *)buff, ptr-buff);
        ptr = &buff[0];
     }
   }
   if (ptr != buff) {
-     out->append((char *)buff, (char *)(ptr-buff));
+     out->append((char *)buff, ptr-buff);
   }
   return p - orig_p;
 }

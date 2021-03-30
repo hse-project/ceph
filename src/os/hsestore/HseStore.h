@@ -255,7 +255,7 @@ class HseStore : public ObjectStore {
   hse_err_t ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid, bool& found,
     hse_oid_t& hse_oid);
 
-  void offset2object_data_key(hse_oid_t &hse_oid, uint64_t offset, std::string *key);
+  void offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset, std::string *key);
 
   hse_err_t kv_write_data(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
     uint64_t offset, size_t length, bufferlist& bl);
