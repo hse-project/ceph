@@ -310,42 +310,6 @@ HseStore::HseStore(CephContext *cct, const std::string& path)
 HseStore::~HseStore()
 {}
 
-int HseStore::write_meta(const std::string& key, const std::string& value)
-{
-  hse_err_t rc = 0;
-  const size_t encoded_key_size = key.size() + 1;
-  auto encoded_key = std::make_unique<uint8_t[]>(encoded_key_size);
-
-  encoded_key[0] = 'G';
-  memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
-  rc = hse_kvs_put(_ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
-    value.c_str(), value.size());
-  if (rc)
-    dout(10) << " failed to write metadata (" << key << ", " << value << ')' << dendl;
-
-  return rc ? -hse_err_to_errno(rc) : 0;
-}
-
-int HseStore::read_meta(const std::string& key, std::string *value)
-{
-  hse_err_t rc = 0;
-  bool found = false;
-  char buf[HSE_KVS_VLEN_MAX];
-  const size_t encoded_key_size = key.size() + 1;
-  auto encoded_key = std::make_unique<uint8_t[]>(encoded_key_size);
-
-  encoded_key[0] = 'G';
-  memcpy(encoded_key.get() + 1, key.c_str(), encoded_key_size - 1);
-  rc = hse_kvs_get(_ceph_metadata_kvs, nullptr, encoded_key.get(), encoded_key_size,
-    &found, buf, sizeof(buf), nullptr);
-  if (rc)
-    dout(10) << " failed to read metadata (" << key << ')' << dendl;
-  if (found)
-    *value = std::string(buf);
-
-  return rc ? -hse_err_to_errno(rc) : 0;
-}
-
 ObjectStore::CollectionHandle HseStore::open_collection(const coll_t &cid)
 {
   std::shared_lock<ceph::shared_mutex> l{coll_lock};
@@ -466,14 +430,53 @@ err_out:
   return rc;
 }
 
-hse_err_t HseStore::create_collection(coll_t cid, unsigned bits, CollectionRef *c)
+/*
+ * TODO "bits" are ignored and not saved.
+ */
+hse_err_t HseStore::kv_create_collection(
+    struct hse_kvdb_opspec *os,
+    const coll_t &cid,
+    unsigned bits)
 {
-  *c = ceph::make_ref<Collection>(this, cid);
+  hse_err_t rc;
 
-  std::unique_lock<ceph::shared_mutex> l{coll_lock};
-  new_coll_map[cid] = *c;
+  std::string coll_tkey;
+  coll_t2key(cct, cid, &coll_tkey);
+  rc = hse_kvs_put(_collection_kvs, os, coll_tkey.c_str(), coll_tkey.length(), nullptr, 0);
+  if (rc) {
+    dout(10) << __func__ << " failed to put the new collection " << cid << dendl;
+  }
+  return rc;
+}
 
-  return 0;
+hse_err_t HseStore::create_collection(
+    struct hse_kvdb_opspec *os,
+    coll_t cid,
+    unsigned bits,
+    CollectionRef *c)
+{
+  hse_err_t rc = 0;
+
+  {
+    std::unique_lock<ceph::shared_mutex> l{coll_lock};
+    if (*c) {
+      rc = EEXIST;
+      goto out;
+    }
+    auto p = new_coll_map.find(cid);
+    ceph_assert(p != new_coll_map.end());
+    *c = p->second;
+    ceph_assert((*c)->cid == cid);
+    // (*c)->cnode.bits = bits;   TODO
+    coll_map[cid] = *c;
+    new_coll_map.erase(p);
+  }
+  rc = kv_create_collection(os, cid, bits);
+  if (rc)
+    dout(10) << __func__ << " failed to create the new collection " << cid << dendl;
+
+out:
+  return rc;
 }
 
 hse_err_t HseStore::split_collection(
@@ -1028,15 +1031,30 @@ uint32_t HseStore::append_zero_blocks_in_bl(
   return block_cnt;
 }
 
+/*
+ * Return offset (in bytes) of the first byte of the data block overlapping "offset"
+ */
 uint32_t HseStore::block_offset(uint64_t offset)
 {
   return offset & ~(DATA_BLOCK_LEN -1);
 }
+/*
+ * Return the relative length (from the beginning of the block, in bytes)
+ * in the last data block.
+ */
 uint32_t HseStore::end_block_length(uint64_t offset, size_t length)
 {
-  return (offset + length) & ~(DATA_BLOCK_LEN -1);
+  return (offset + length) & (DATA_BLOCK_LEN -1);
 }
 
+/*
+ * It happend that Ceph read oject data passing a length set to 0.
+ * In that case Ceph expects all the object data to be returned.
+ * An example is when Ceoh OSD daemon reads its superblock.
+ *
+ * Note that this function calls hse_kvs_cursor_seek() that can't be called in the context
+ * of a transaction.
+ */
 hse_err_t HseStore::kv_read_data(
     struct hse_kvdb_opspec *os,
     Onode& o,
@@ -1064,6 +1082,15 @@ hse_err_t HseStore::kv_read_data(
 
   dout(20) << __func__ << " " << offset << "~" << length << dendl;
 
+  // Temporary TODO
+  if (length == 0)
+    length = 563;
+
+  if (offset + length > MAX_DATA_LEN) {
+    ceph_assert("offset + length too big");
+    return EINVAL;
+  }
+
   // To avoid data copy:
   // - free whatever buffers present in bl (done by bl.clear())
   // - this function will allocate adequate buffers to avoid data copy and these
@@ -1082,7 +1109,7 @@ hse_err_t HseStore::kv_read_data(
   end_block_rel_length = end_block_length(offset, length);
   end_block_nb = end_block_offset >> DATA_BLOCK_SHIFT;
 
-  if (start_block_nb == end_block_nb) {
+  if (length && (start_block_nb == end_block_nb)) {
 
     //
     // The read in contained in one block, do not use a cursor.
@@ -1126,7 +1153,6 @@ hse_err_t HseStore::kv_read_data(
   // previous write operations from the current Ceph transaction.
   //
   struct hse_kvs_cursor *cursor;
-  os->kop_flags = HSE_KVDB_KOP_FLAG_BIND_TXN;
   rc = hse_kvs_cursor_create(_object_data_kvs, os, (void *)(&o.o_hse_oid),
     sizeof(hse_oid_t), &cursor);
   if (rc) {
@@ -1170,16 +1196,23 @@ hse_err_t HseStore::kv_read_data(
       goto end;
     }
     if (eof) {
-      cursor_block_nb = INT_MAX;
+      if (length) {
+        // Adjust cursor_block_nb to add the correct number of zero buffers/pages
+        // in the call to append_zero_blocks_in_bl() below.
+        // We need zero buffers till end_block_nb included.
+        cursor_block_nb = end_block_nb + 1;
+      } else {
+	// No need to add zero buffers (with the call to append_zero_blocks_in_bl() below).
+	// We stop at the last block found (before eof).
+        cursor_block_nb = prev_cursor_block_nb + 1;
+      }
     } else {
       ceph_assert(cursor_block_key_len == OBJECT_DATA_KEY_LEN);
       ceph_assert(val_len == DATA_BLOCK_LEN);
       cursor_block_nb = object_data_key2block_nb(cursor_block_key);
-    }
-    if (cursor_block_nb > end_block_nb) {
-      // Adjust cursor_block_nb to add the correct number of zero buffers/pages
-      // in the call to append_zero_blocks_in_bl() below.
-      cursor_block_nb = end_block_nb + 1;
+      if (cursor_block_nb > end_block_nb + 1) {
+	cursor_block_nb  = end_block_nb + 1;
+      }
     }
 
 
@@ -1192,7 +1225,7 @@ hse_err_t HseStore::kv_read_data(
       offset_in_block = start_block_rel_offset;
     }
     length_in_block = DATA_BLOCK_LEN;
-    if (cursor_block_nb == end_block_nb + 1) {
+    if (length && (cursor_block_nb == end_block_nb + 1)) {
       // Adjust length in the last buffer.
       length_in_block = end_block_rel_length;
     }
@@ -1201,7 +1234,7 @@ hse_err_t HseStore::kv_read_data(
 
 
 
-    if (cursor_block_nb > end_block_nb) {
+    if ((length && (cursor_block_nb > end_block_nb)) || eof) {
       break;
     }
 
@@ -1214,7 +1247,7 @@ hse_err_t HseStore::kv_read_data(
       // Adjust it start offset.
       ptr.set_offset(start_block_rel_offset);
     }
-    if (cursor_block_nb == end_block_nb) {
+    if (length && (cursor_block_nb == end_block_nb)) {
       // This is the last block returned.
       // Adjust the length in the buffer.
       ptr.set_length(end_block_rel_length);
@@ -1226,7 +1259,7 @@ hse_err_t HseStore::kv_read_data(
   }
 
 end:
-  if (!rc) {
+  if (!rc && length) {
     ceph_assert(bl.length() == length);
   }
   if (hse_kvs_cursor_destroy(cursor)) {
@@ -1255,20 +1288,8 @@ int HseStore::read(
     return -ENOENT;
   }
 
-  //
-  // Start a hse transaction.
-  //
-  os.kop_txn = hse_kvdb_txn_alloc(_kvdb);
-  rc = hse_kvdb_txn_begin(_kvdb, os.kop_txn);
-  if (rc) {
-    dout(10) << __func__ << " failed to begin transaction " << c->cid << dendl;
-    goto end;
-  }
-
   rc = HseStore::kv_read_data(&os, o, offset, len, bl);
 
-end:
-  hse_kvdb_txn_free(_kvdb, os.kop_txn);
   return -hse_err_to_errno(rc);
 }
 
@@ -1471,7 +1492,7 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
       {
         ceph_assert(!c);
         const coll_t &cid = i.get_cid(op->cid);
-        rc = create_collection(cid, op->split_bits, &c);
+        rc = create_collection(&os, cid, op->split_bits, &c);
         if (!rc)
           continue;
       }
@@ -2091,9 +2112,13 @@ hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid,
     goto err_out;
   }
 
-  // The last 8 bytes of the key are the hse_oid.
-  memcpy(&hse_oid, &(((uint8_t *)foundkey)[foundkey_len - sizeof(hse_oid_t)]),  sizeof(hse_oid_t));
-  found = foundkey != nullptr;
+  if (foundkey_len) {
+    ceph_assert(foundkey_len == filt_max_len);
+    // The last 8 bytes of the key are the hse_oid.
+    memcpy(&hse_oid, &(((uint8_t *)foundkey)[foundkey_len - sizeof(hse_oid_t)]),
+      sizeof(hse_oid_t));
+    found = true;
+  }
 
   rc = hse_kvs_cursor_destroy(cursor);
   if (rc) {
@@ -2261,3 +2286,25 @@ hse_err_t HseStore::kv_create_obj(
   o.o_exists = true;
   return rc;
 }
+
+/* Temporary hack, TODO */
+int HseStore::statfs(struct store_statfs_t* buf0, osd_alert_list_t* alerts)
+{
+  buf0->reset();
+
+  // Todo put real values.
+  // For now reply always 2 TB
+  buf0->total = 2ULL*1024*1024*1204*1024;
+  buf0->available = buf0->total;
+
+  return 0;
+}
+
+/* Temporary hack, TODO */
+ObjectMap::ObjectMapIterator HseStore::get_omap_iterator(
+  CollectionHandle &c, 
+  const ghobject_t &oid) 
+{
+  return ObjectMap::ObjectMapIterator();
+}
+

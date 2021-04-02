@@ -50,8 +50,17 @@ extern "C" {
 
 // Data block in KVS object_data_kvs is 2^DATA_BLOCK_SHIFT
 #define DATA_BLOCK_SHIFT 12
+
 #define DATA_BLOCK_LEN (1ULL << DATA_BLOCK_SHIFT)
+
+// Maximum object data block number that HseStore can handle.
+#define MAX_BLOCK_NB ((1ULL << 32) -1) // INT_MAX
+// Maximum amount of data in one object, in bytes.
+#define MAX_DATA_LEN ((MAX_BLOCK_NB + 1)*DATA_BLOCK_LEN)
+
 #define OBJECT_DATA_KEY_LEN (sizeof(hse_oid_t) + sizeof(uint32_t))
+
+
 
 class WaitCond {
   boost::condition_variable   _done_cond;
@@ -246,7 +255,7 @@ class HseStore : public ObjectStore {
 
   void start_one_transaction(Collection *c, Transaction *t);
   hse_err_t remove_collection(struct hse_kvdb_opspec *os, coll_t cid, CollectionRef *c);
-  hse_err_t create_collection(coll_t cid, unsigned bits, CollectionRef *c);
+  hse_err_t create_collection(struct hse_kvdb_opspec *os, coll_t cid, unsigned bits, CollectionRef *c);
   hse_err_t split_collection(struct hse_kvdb_opspec *os, CollectionRef& c, CollectionRef& d,
     unsigned bits, int rem);
   hse_err_t merge_collection(struct hse_kvdb_opspec *os, CollectionRef *c, CollectionRef& d,
@@ -256,6 +265,8 @@ class HseStore : public ObjectStore {
     hse_oid_t& hse_oid);
 
   void offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset, std::string *key);
+
+  hse_err_t kv_create_collection(struct hse_kvdb_opspec *os, const coll_t &cid, unsigned bits);
 
   hse_err_t kv_write_data(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
     uint64_t offset, size_t length, bufferlist& bl);
@@ -324,15 +335,11 @@ public:
     return false;
   }
 
-  int statfs(struct store_statfs_t *buf, osd_alert_list_t* alerts = nullptr) override {
-    return -EOPNOTSUPP;
-  }
+  int statfs(struct store_statfs_t *buf, osd_alert_list_t* alerts = nullptr) override;
+
   int pool_statfs(uint64_t pool_id, struct store_statfs_t *buf, bool *per_pool_omap) override {
     return -EOPNOTSUPP;
   }
-
-  int write_meta(const std::string& key, const std::string& value) override;
-  int read_meta(const std::string& key, std::string *value) override;
 
   CollectionHandle open_collection(const coll_t &cid) override;
 
@@ -428,10 +435,7 @@ public:
     return -EOPNOTSUPP;
   }
 
-  ObjectMap::ObjectMapIterator get_omap_iterator(
-      CollectionHandle &c, const ghobject_t &oid) override {
-    return {};
-  }
+  ObjectMap::ObjectMapIterator get_omap_iterator(CollectionHandle &c, const ghobject_t &oid) override;
 
   void set_fsid(uuid_d u) override { fsid = u; }
   uuid_d get_fsid() override { return fsid; }
@@ -443,13 +447,28 @@ private:
   std::string_view kvdb_name;
   uuid_d fsid;
 
-  struct hse_kvdb *_kvdb;
-  struct hse_kvs *_ceph_metadata_kvs;
-  struct hse_kvs *_collection_kvs;
-  struct hse_kvs *_collection_object_kvs;
-  struct hse_kvs *_object_data_kvs;
-  struct hse_kvs *_object_xattr_kvs;
-  struct hse_kvs *_object_omap_kvs;
+  struct hse_kvdb *_kvdb = nullptr;
+  struct hse_kvs *_ceph_metadata_kvs = nullptr;;
+
+  // Key is coll_t2key
+  // No value
+  struct hse_kvs *_collection_kvs = nullptr;
+
+  // Key is coll_t2key + hse_oid_t (8 bytes)
+  // No value
+  struct hse_kvs *_collection_object_kvs = nullptr;
+
+  // Key is hse_oid_t (8 bytes) + data block number (4 bytes)
+  // One data block aka 4kib
+  struct hse_kvs *_object_data_kvs = nullptr;
+
+  // Key is hse_oid_t (8 bytes) + xattr_key
+  // xattr_val
+  struct hse_kvs *_object_xattr_kvs = nullptr;
+
+  // Key is hse_oid_t (8 bytes) + omap_key + omap_block_number
+  // omap value (or part of it if not fitting in one block)
+  struct hse_kvs *_object_omap_kvs = nullptr;
 
   HseStore::CollectionRef get_collection(coll_t cid);
 
