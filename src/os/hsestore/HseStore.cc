@@ -1087,7 +1087,7 @@ hse_err_t HseStore::kv_read_data(
     length = 563;
 
   if (offset + length > MAX_DATA_LEN) {
-    ceph_assert("offset + length too big");
+    dout(20) << __func__ << " offset + length too big" << dendl;
     return EINVAL;
   }
 
