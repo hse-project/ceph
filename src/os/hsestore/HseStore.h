@@ -60,6 +60,9 @@ extern "C" {
 
 #define OBJECT_DATA_KEY_LEN (sizeof(hse_oid_t) + sizeof(uint32_t))
 
+// Size of the omap block number at the end of the key used in the kvs object_omap
+#define OMAP_BLOCK_NB_LEN (sizeof(uint32_t))
+
 
 
 class WaitCond {
@@ -172,6 +175,7 @@ class HseStore : public ObjectStore {
     // True if the object is KVS collection_object_kvs
     bool o_exists;
     hse_oid_t o_hse_oid;
+    uint64_t o_data_len; // Total length of the object data (from offset 0 to last byte).
 
     // Object not yet in KVS collection_object_kvs, but the operation will create the object and
     // put it in the KVS.
@@ -179,7 +183,8 @@ class HseStore : public ObjectStore {
     bool o_dirty;
 
     // Default constructor
-    Onode() : o_gotten(false), o_oid(nullptr), o_exists(false), o_dirty(false) {
+    Onode() : o_gotten(false), o_oid(nullptr), o_exists(false), o_hse_oid(0), o_data_len(0),
+      o_dirty(false) {
     }
   };
 
@@ -262,7 +267,7 @@ class HseStore : public ObjectStore {
       unsigned bits);
 
   hse_err_t ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid, bool& found,
-    hse_oid_t& hse_oid);
+    hse_oid_t& hse_oid, uint64_t& o_data_len);
 
   void offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset, std::string *key);
 
@@ -276,11 +281,29 @@ class HseStore : public ObjectStore {
     bufferlist& bl);
 
   hse_err_t kv_create_obj(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o);
+  hse_err_t kv_omap_rm_one_kv(struct hse_kvdb_opspec *os, Onode& o, const std::string& omap_key);
+  hse_err_t kv_update_obj_data_len(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
+    uint64_t object_data_len);
+
+
   uint32_t object_data_key2block_nb(std::string& object_data_key);
   uint32_t block_offset(uint64_t offset);
   uint32_t end_block_length(uint64_t offset, size_t length);
   uint32_t append_zero_blocks_in_bl(int32_t first_block_nb, int32_t last_block_nb, bufferlist& bl,
     uint32_t first_offset, uint32_t last_length);
+
+  void omap_hse_key(hse_oid_t hse_oid, const std::string& omap_key, uint32_t omap_block_nb,
+    std::string *omap_block_hse_key);
+
+  hse_err_t _omap_rmkeys(CollectionRef& c, Onode& o, bufferlist& keys_bl);
+
+  hse_err_t hse_kvs_cursor_seek_wrapper(struct hse_kvs_cursor *cursor,
+    struct hse_kvdb_opspec *opspec, const void *key, size_t key_len, const void **found,
+    size_t * found_len);
+  hse_err_t hse_kvs_cursor_read_wrapper(struct hse_kvs_cursor *cursor,
+    struct hse_kvdb_opspec *opspec, const void **key, size_t *key_len, const void **val,
+    size_t *val_len, bool *eof);
+
 
 
 public:
@@ -455,7 +478,7 @@ private:
   struct hse_kvs *_collection_kvs = nullptr;
 
   // Key is coll_t2key + hse_oid_t (8 bytes)
-  // No value
+  // Value is the length of the object data (8 bytes)
   struct hse_kvs *_collection_object_kvs = nullptr;
 
   // Key is hse_oid_t (8 bytes) + data block number (4 bytes)

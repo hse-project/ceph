@@ -191,7 +191,6 @@ void HseStore::Collection::get_onode(
   const ghobject_t& oid,
   bool create)
 {
-  hse_oid_t hse_oid;
   bool found;
 
   if (!o.o_gotten) {
@@ -204,10 +203,9 @@ void HseStore::Collection::get_onode(
     return;
 
 
-  this->_store->ghobject_t2hse_oid(this->cid, oid, found, hse_oid);
+  this->_store->ghobject_t2hse_oid(this->cid, oid, found, o.o_hse_oid, o.o_data_len);
 
   if (found) {
-    o.o_hse_oid = hse_oid;
     o.o_exists = true;
   } else {
     if (create)
@@ -331,8 +329,9 @@ bool HseStore::exists(CollectionHandle &c, const ghobject_t &oid)
 {
   bool found;
   hse_oid_t hse_oid;
+  uint64_t o_data_len;
 
-  ghobject_t2hse_oid(c->cid, oid, found, hse_oid);
+  ghobject_t2hse_oid(c->cid, oid, found, hse_oid, o_data_len);
 
   return found;
 }
@@ -365,6 +364,7 @@ HseStore::CollectionRef HseStore::get_collection(coll_t cid)
 int HseStore::collection_empty(CollectionHandle &c, bool *empty)
 {
   hse_err_t rc = 0;
+  hse_err_t rc1;
 
   std::string coll_tkey;
   coll_t2key(cct, c->cid, &coll_tkey);
@@ -375,7 +375,7 @@ int HseStore::collection_empty(CollectionHandle &c, bool *empty)
   if (rc) {
     dout(10) << " failed to create cursor while checking if collection ("
       << c->cid << ") is empty" << dendl;
-    goto err_out;
+    goto end;
   }
 
   rc = hse_kvs_cursor_read(cursor, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -383,18 +383,17 @@ int HseStore::collection_empty(CollectionHandle &c, bool *empty)
   if (rc) {
     dout(10) << " failed to read from cursor while checking if collection ("
       << c->cid << ") is empty" << dendl;
-    goto destroy_cursor;
   }
 
-destroy_cursor:
-  rc = hse_kvs_cursor_destroy(cursor);
-  if (rc) {
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
     dout(10) << " failed to destroy cursor while checking if collection ("
       << c->cid << ") is empty" << dendl;
-    goto err_out;
+    if (!rc)
+      rc = rc1;
   }
 
-err_out:
+end:
   return rc ? -hse_err_to_errno(rc) : 0;
 }
 
@@ -484,6 +483,7 @@ hse_err_t HseStore::split_collection(
     CollectionRef& c, CollectionRef& d, unsigned bits, int rem)
 {
   hse_err_t rc = 0;
+  hse_err_t rc1;
   struct hse_kvs_cursor *cursor;
   bool eof = false;
 
@@ -500,18 +500,18 @@ hse_err_t HseStore::split_collection(
   if (rc) {
     dout(10) << " failed to create cursor while splitting collection ("
       << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
+    return rc;
   }
 
   while (!eof) {
     const uint8_t *key;
     size_t key_len;
-    rc = hse_kvs_cursor_read(cursor, os, reinterpret_cast<const void **>(&key),
+    rc = hse_kvs_cursor_read_wrapper(cursor, os, reinterpret_cast<const void **>(&key),
       &key_len, nullptr, nullptr, &eof);
     if (rc) {
       dout(10) << " failed to read from cursor while splitting collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
-      goto err_out;
+      goto destroy;
     }
 
     std::string_view ghobject_tkey {
@@ -520,7 +520,7 @@ hse_err_t HseStore::split_collection(
     ghobject_t obj;
     if (const int err = key2ghobject_t(ghobject_tkey, obj)) {
       dout(10) << " failed to convert key (" << ghobject_tkey << ") to ghobject_t: " << err << dendl;
-      goto err_out;
+      goto destroy;
     }
 
     // if not a match don't put/delete; this check was stolen from MemStore
@@ -537,25 +537,24 @@ hse_err_t HseStore::split_collection(
     if (rc) {
       dout(10) << " failed to read from cursor while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
-      goto err_out;
+      goto destroy;
     }
 
     rc = hse_kvs_delete(_collection_object_kvs, os, key, key_len);
     if (rc) {
       dout(10) << " failed to data from collection while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
-      goto err_out;
     }
   }
 
-  rc = hse_kvs_cursor_destroy(cursor);
-  if (rc) {
+destroy:
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
     dout(10) << " failed to destroy cursor while merging collections ("
       << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
+    if (!rc)
+      rc = rc1;
   }
-
-err_out:
   return rc;
 }
 
@@ -565,6 +564,7 @@ hse_err_t HseStore::merge_collection(
 {
   // HSE_TODO: what to do with bits?
   hse_err_t rc = 0;
+  hse_err_t rc1;
   struct hse_kvs_cursor *cursor;
   bool eof = false;
 
@@ -581,18 +581,18 @@ hse_err_t HseStore::merge_collection(
   if (rc) {
     dout(10) << " failed to create cursor while merging collections (" <<
       old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
+    return rc;
   }
 
   while (!eof) {
     const uint8_t *key;
     size_t key_len;
-    rc = hse_kvs_cursor_read(cursor, os, reinterpret_cast<const void **>(&key),
+    rc = hse_kvs_cursor_read_wrapper(cursor, os, reinterpret_cast<const void **>(&key),
       &key_len, nullptr, nullptr, &eof);
     if (rc) {
       dout(10) << " failed to read from cursor while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
-      goto err_out;
+      goto destroy;
     }
 
     auto new_key = std::make_unique<uint8_t[]>(key_len);
@@ -603,7 +603,7 @@ hse_err_t HseStore::merge_collection(
     if (rc) {
       dout(10) << " failed to put while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
-      goto err_out;
+      goto destroy;
     }
   }
 
@@ -612,17 +612,16 @@ hse_err_t HseStore::merge_collection(
   if (rc) {
     dout(10) << " failed to prefix delete data from collection while merging collections ("
       << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
   }
 
-  rc = hse_kvs_cursor_destroy(cursor);
-  if (rc) {
+destroy:
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
     dout(10) << " failed to destroy cursor while merging collections ("
       << old_cid << "->" << new_cid << ')' << dendl;
-    goto err_out;
+    if (!rc)
+      rc = rc1;
   }
-
-err_out:
   return rc;
 }
 
@@ -673,6 +672,7 @@ int HseStore::queue_transactions(
 int HseStore::mount()
 {
   hse_err_t rc = 0;
+  hse_err_t rc1;
   bool fsid_found = false;
   static const char fsid_key[] = CEPH_METADATA_GENERAL_KEY("fsid");
   // 36 is length of UUID, +1 for NUL byte
@@ -682,57 +682,57 @@ int HseStore::mount()
 
   rc = hse_kvdb_init();
   if (rc) {
-    goto err_out;
+    goto end;
   }
 
   rc = hse_kvdb_open(kvdb_name.data(), nullptr, &_kvdb);
   if (rc) {
     dout(10) << " failed to open the kvdb" << dendl;
-    goto err_out;
+    goto end;
   }
 
   /* HSE_TODO: how to handle error logic here */
   rc = hse_kvdb_kvs_open(_kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr, &_ceph_metadata_kvs);
   if (rc) {
     dout(10) << " failed to open the ceph-metadata kvs" << dendl;
-    goto err_out;
+    goto end;
   }
 
   rc = hse_kvdb_kvs_open(_kvdb, COLLECTION_KVS_NAME.data(), nullptr, &_collection_kvs);
   if (rc) {
     dout(10) << " failed to open the collection kvs" << dendl;
-    goto err_out;
+    goto end;
   }
 
   rc = hse_kvdb_kvs_open(_kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr, &_collection_object_kvs);
   if (rc) {
     dout(10) << " failed to open the collection-object kvs" << dendl;
-    goto err_out;
+    goto end;
   }
 
   rc = hse_kvdb_kvs_open(_kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr, &_object_data_kvs);
   if (rc) {
     dout(10) << " failed to open the object-data kvs" << dendl;
-    goto err_out;
+    goto end;
   }
 
   rc = hse_kvdb_kvs_open(_kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr, &_object_xattr_kvs);
   if (rc) {
     dout(10) << " failed to open the object-xattr kvs" << dendl;
-    goto err_out;
+    goto end;
   }
 
   rc = hse_kvdb_kvs_open(_kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr, &_object_omap_kvs);
   if (rc) {
     dout(10) << " failed to open the object-omap kvs" << dendl;
-    goto err_out;
+    goto end;
   }
 
   struct hse_kvs_cursor *cursor;
   rc = hse_kvs_cursor_create(_collection_kvs, nullptr, nullptr, 0, &cursor);
   if (rc) {
     dout(10) << " failed to create a cursor for populating the in-memory collection map" << dendl;
-    goto err_out;
+    goto end;
   }
 
   const uint8_t *key, *val;
@@ -743,7 +743,7 @@ int HseStore::mount()
       &key_len, reinterpret_cast<const void **>(&val), &val_len, &eof);
     if (rc) {
       dout(10) << " failed to read cursor for populating initial coll_map" << dendl;
-      goto err_out;
+      goto destroy;
     }
 
     if (eof)
@@ -753,16 +753,10 @@ int HseStore::mount()
     coll_t cid;
     if (const int err = key2coll_t(coll_tkey, cid)) {
       dout(10) << " failed to convert key (" << coll_tkey << ") to coll_t: " << err << dendl;
-      goto err_out;
+      goto destroy;
     }
 
     coll_map[cid] = ceph::make_ref<Collection>(this, std::move(cid));
-  }
-
-  rc = hse_kvs_cursor_destroy(cursor);
-  if (rc) {
-    dout(10) << " failed to destroy cursor while populating initial coll_map" << dendl;
-    goto err_out;
   }
 
   // -1 removed the NUL byte
@@ -770,16 +764,23 @@ int HseStore::mount()
     &fsid_found, fsid_buf, sizeof(fsid_buf) - 1, &fsid_len);
   if (rc) {
     dout(10) << " failed to get fsid" << dendl;
-    goto err_out;
+    goto destroy;
   }
   ceph_assert(sizeof(fsid_buf) - 1 == fsid_len);
   if (!fsid.parse(reinterpret_cast<char *>(fsid_buf))) {
     dout(10) << " failed to parse fsid" << dendl;
     rc = ENOTRECOVERABLE;
-    goto err_out;
   }
 
-err_out:
+destroy:
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
+    dout(10) << " failed to destroy cursor while populating initial coll_map" << dendl;
+    if (!rc)
+      rc = rc1;
+  }
+
+end:
   return rc ? -hse_err_to_errno(rc) : 0;
 }
 
@@ -993,7 +994,7 @@ void HseStore::offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset,
   ceph_assert(key->length() == OBJECT_DATA_KEY_LEN);
 }
 
-// Return the block number from the key used in kvs _object_data_kvs (hse_oid +
+// Return the object data block number from the key used in kvs _object_data_kvs (hse_oid +
 // encoded block number)
 uint32_t HseStore::object_data_key2block_nb(
     std::string& object_data_key)
@@ -1063,6 +1064,7 @@ hse_err_t HseStore::kv_read_data(
     bufferlist& bl)
 {
   hse_err_t rc = 0;
+  hse_err_t rc1;
   std::string start_block_key;
   int32_t prev_cursor_block_nb;
   std::string cursor_block_key;
@@ -1080,14 +1082,18 @@ hse_err_t HseStore::kv_read_data(
   uint32_t end_block_rel_length;
 
 
-  dout(20) << __func__ << " " << offset << "~" << length << dendl;
+  dout(10) << __func__ << " " << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << " " << offset << "~" << length << ":" << o.o_data_len << dendl;
 
-  // Temporary TODO
-  if (length == 0)
-    length = 563;
+  if (length == 0) {
+    // Return all the object data from the passed in offset.
+    if (o.o_data_len >= offset) {
+      length = o.o_data_len - offset;
+    }
+  }
 
   if (offset + length > MAX_DATA_LEN) {
-    dout(20) << __func__ << " offset + length too big" << dendl;
+    dout(10) << __func__ << " offset + length too big" << dendl;
     return EINVAL;
   }
 
@@ -1109,7 +1115,7 @@ hse_err_t HseStore::kv_read_data(
   end_block_rel_length = end_block_length(offset, length);
   end_block_nb = end_block_offset >> DATA_BLOCK_SHIFT;
 
-  if (length && (start_block_nb == end_block_nb)) {
+  if (start_block_nb == end_block_nb) {
 
     //
     // The read in contained in one block, do not use a cursor.
@@ -1153,8 +1159,18 @@ hse_err_t HseStore::kv_read_data(
   // previous write operations from the current Ceph transaction.
   //
   struct hse_kvs_cursor *cursor;
+
+  // to remove
+  struct hse_kvdb_txn *kop_txn_sav;
+  kop_txn_sav = os->kop_txn;
+  os->kop_txn = NULL;
+
   rc = hse_kvs_cursor_create(_object_data_kvs, os, (void *)(&o.o_hse_oid),
     sizeof(hse_oid_t), &cursor);
+
+  // to remove
+  os->kop_txn = kop_txn_sav;
+
   if (rc) {
     dout(10) << __func__ << " failed to create a cursor data" << dendl;
     return rc;
@@ -1163,8 +1179,8 @@ hse_err_t HseStore::kv_read_data(
   //
   // Go to the first block. It may not exist.
   //
-  rc = hse_kvs_cursor_seek(cursor, os, start_block_key.c_str(), start_block_key.length(),
-    &seek_found, &seek_found_len);
+  rc = hse_kvs_cursor_seek_wrapper(cursor, os, start_block_key.c_str(),
+      start_block_key.length(), &seek_found, &seek_found_len);
   if (rc) {
     dout(10) << __func__ << " failed to seek to start block" << dendl;
     goto end;
@@ -1185,27 +1201,22 @@ hse_err_t HseStore::kv_read_data(
 
   while (true) {
     bool eof;
-    uint32_t offset_in_block;
-    uint32_t length_in_block;
+    uint32_t block_rel_offset;
+    uint32_t block_rel_length;
     int32_t cursor_block_nb;
 
-    rc = hse_kvs_cursor_read(cursor, os, reinterpret_cast<const void **>(&cursor_block_key),
+    rc = hse_kvs_cursor_read_wrapper(cursor, os,
+      reinterpret_cast<const void **>(&cursor_block_key),
       &cursor_block_key_len, reinterpret_cast<const void **>(&val), &val_len, &eof);
     if (rc) {
       dout(10) << __func__ << " cursor read failed" << dendl;
       goto end;
     }
     if (eof) {
-      if (length) {
-        // Adjust cursor_block_nb to add the correct number of zero buffers/pages
-        // in the call to append_zero_blocks_in_bl() below.
-        // We need zero buffers till end_block_nb included.
-        cursor_block_nb = end_block_nb + 1;
-      } else {
-	// No need to add zero buffers (with the call to append_zero_blocks_in_bl() below).
-	// We stop at the last block found (before eof).
-        cursor_block_nb = prev_cursor_block_nb + 1;
-      }
+      // Adjust cursor_block_nb to add the correct number of zero buffers/pages
+      // in the call to append_zero_blocks_in_bl() below.
+      // We need zero buffers till end_block_nb included.
+      cursor_block_nb = end_block_nb + 1;
     } else {
       ceph_assert(cursor_block_key_len == OBJECT_DATA_KEY_LEN);
       ceph_assert(val_len == DATA_BLOCK_LEN);
@@ -1219,22 +1230,22 @@ hse_err_t HseStore::kv_read_data(
     //
     // Add zeroed buffers for the blocks before the cursor position.
     //
-    offset_in_block = 0;
+    block_rel_offset = 0;
     if (prev_cursor_block_nb + 1 == start_block_nb) {
-      //
-      offset_in_block = start_block_rel_offset;
+      // Adjust offset in the first buffer
+      block_rel_offset = start_block_rel_offset;
     }
-    length_in_block = DATA_BLOCK_LEN;
-    if (length && (cursor_block_nb == end_block_nb + 1)) {
+    block_rel_length = DATA_BLOCK_LEN;
+    if (cursor_block_nb == end_block_nb + 1) {
       // Adjust length in the last buffer.
-      length_in_block = end_block_rel_length;
+      block_rel_length = end_block_rel_length;
     }
     append_zero_blocks_in_bl(prev_cursor_block_nb + 1,
-      cursor_block_nb, bl, offset_in_block, length_in_block);
+      cursor_block_nb, bl, block_rel_offset, block_rel_length);
 
 
 
-    if ((length && (cursor_block_nb > end_block_nb)) || eof) {
+    if ((cursor_block_nb > end_block_nb) || eof) {
       break;
     }
 
@@ -1247,7 +1258,7 @@ hse_err_t HseStore::kv_read_data(
       // Adjust it start offset.
       ptr.set_offset(start_block_rel_offset);
     }
-    if (length && (cursor_block_nb == end_block_nb)) {
+    if (cursor_block_nb == end_block_nb) {
       // This is the last block returned.
       // Adjust the length in the buffer.
       ptr.set_length(end_block_rel_length);
@@ -1259,13 +1270,15 @@ hse_err_t HseStore::kv_read_data(
   }
 
 end:
-  if (!rc && length) {
+  if (!rc) {
     ceph_assert(bl.length() == length);
   }
-  if (hse_kvs_cursor_destroy(cursor)) {
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
     dout(10) << __func__ << " failed to destroy cursor" << dendl;
+    if (!rc)
+      rc = rc1;
   }
-
   return rc;
 }
 
@@ -1285,6 +1298,8 @@ int HseStore::read(
   Collection *c = static_cast<Collection*>(ch.get());
   c->get_onode(o, oid, true);
   if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << *o.o_oid
+	   << " " << offset << "~" << len << dendl;
     return -ENOENT;
   }
 
@@ -1313,7 +1328,7 @@ hse_err_t HseStore::kv_write_data(
   bufferlist::iterator i(&bl);
   uint32_t to_copy_in_block;
 
-  dout(15) << __func__ << " " << c->cid << " " << *o.o_oid
+  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
 	   << " " << offset << "~" << length
 	   << dendl;
 
@@ -1414,9 +1429,14 @@ hse_err_t HseStore::kv_write_data(
   }
 
 end:
-  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid
-	   << " " << start_offset << "~" << end_offset - start_offset
-	   << " = " << rc << dendl;
+  if (!rc) {
+    // Record the new length of the object data
+    if (offset + length >= o.o_data_len) {
+      rc = kv_update_obj_data_len(os, c, o, offset + length);
+    }
+  }
+  dout(10) << __func__ << " return " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << " object data len " << o.o_data_len << " rc " << rc << dendl;
   return rc;
 }
 
@@ -1722,13 +1742,15 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	r = _omap_setkeys(txc, c, o, aset_bl);
       }
       break;
+#endif
     case Transaction::OP_OMAP_RMKEYS:
       {
 	bufferlist keys_bl;
         i.decode_keyset_bl(&keys_bl);
-	r = _omap_rmkeys(txc, c, o, keys_bl);
+	rc = HseStore::_omap_rmkeys(c, o, keys_bl);
       }
       break;
+#if 0
     case Transaction::OP_OMAP_RMKEYRANGE:
       {
         string first, last;
@@ -2072,9 +2094,10 @@ static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string 
  * Get the hse_oid from the ghobject_t looking in _collection_object_kvs
  */
 hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid, bool& found,
-    HseStore::hse_oid_t& hse_oid)
+    HseStore::hse_oid_t& hse_oid, uint64_t& o_data_len)
 {
   hse_err_t rc = 0;
+  hse_err_t rc1;
   const void *foundkey = nullptr;
   size_t foundkey_len;
 
@@ -2096,11 +2119,12 @@ hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid,
   memset(filt_max.get() + filt_min_len, 0xFF, sizeof(HseStore::hse_oid_t));
 
   struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(_collection_object_kvs, nullptr, coll_tkey.c_str(), coll_tkey.size(), &cursor);
+  rc = hse_kvs_cursor_create(_collection_object_kvs, nullptr, coll_tkey.c_str(),
+      coll_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor when check existence of object ("
       << oid << ") with collection (" << cid << ')' << dendl;
-    goto err_out;
+    return rc;
   }
 
   // if everything is correct, there is only one key in this range
@@ -2113,22 +2137,40 @@ hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid,
   }
 
   if (foundkey_len) {
+    const char *p;
+    uint64_t val;
+    size_t val_len;
+    bool found_val;
+
     ceph_assert(foundkey_len == filt_max_len);
     // The last 8 bytes of the key are the hse_oid.
-    memcpy(&hse_oid, &(((uint8_t *)foundkey)[foundkey_len - sizeof(hse_oid_t)]),
-      sizeof(hse_oid_t));
+    p = &(((const char *)foundkey)[foundkey_len - sizeof(hse_oid_t)]);
+    p = _key_decode_u64(p, &hse_oid);
+
+    rc = hse_kvs_get(_collection_object_kvs, nullptr, foundkey, foundkey_len,
+      &found_val, &val, sizeof(val), &val_len);
+    if (rc) {
+      dout(10) << " failed to get the object data length" << dendl;
+      goto err_out;
+    }
+
+    ceph_assert(found_val);
+    ceph_assert(val_len == sizeof(uint64_t));
+    p = (char *)(&val);
+    p = _key_decode_u64(p, &o_data_len);
     found = true;
   }
 
-  rc = hse_kvs_cursor_destroy(cursor);
-  if (rc) {
+err_out:
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
     dout(10) << " failed to destroy cursor while checking existence of object ("
       << oid << ") in collection (" << cid << ')' << dendl;
-    goto err_out;
+    if (!rc)
+      rc = rc1;
   }
 
-err_out:
-  return rc;
+  return rc ? rc : rc1;
 }
 
 /*
@@ -2255,32 +2297,48 @@ static int key2coll_t(const std::string_view key, coll_t &coll)
   return 0;
 }
 
+hse_err_t HseStore::kv_update_obj_data_len(
+  struct hse_kvdb_opspec *os,
+  CollectionRef& c,
+  Onode& o,
+  uint64_t object_data_len)
+{
+  hse_err_t rc;
+  std::string key;
+  std::string sval;
+
+  key.append(c->_coll_tkey);
+  key.append(o.o_ghobject_tkey);
+  _key_encode_u64(o.o_hse_oid, &key);
+  _key_encode_u64(object_data_len, &sval); // 8 bytes
+
+  rc = hse_kvs_put(_collection_object_kvs, os, key.c_str(), key.length(),
+    sval.c_str(), sval.length());
+  if (rc) {
+    dout(10) << __func__ << " failed to put in _collection_object_kvs" << dendl;
+    return rc;
+  }
+  o.o_data_len = object_data_len;
+
+  return rc;
+}
+
 hse_err_t HseStore::kv_create_obj(
   struct hse_kvdb_opspec *os,
   CollectionRef& c,
   Onode& o)
 {
-  size_t klen1;
-  size_t klen2;
-  size_t klen3;
   hse_err_t rc;
 
   ceph_assert(!o.o_exists);
 
   o.o_hse_oid = this->_next_hse_oid++;
 
-  klen1 = c->_coll_tkey.size();
-  klen2 = o.o_ghobject_tkey.size();
-  klen3 = sizeof(hse_oid_t);
-  auto key = std::make_unique<uint8_t[]>(klen1 + klen2 + klen3);
-  memcpy(key.get(), c->_coll_tkey.c_str(), klen1);
-  memcpy(key.get() + klen1, o.o_ghobject_tkey.c_str(), klen2);
-  memcpy(key.get() + klen1 + klen2, &o.o_hse_oid, klen3);
+  dout(10) << __func__ << " " << *o.o_oid << " hse_oid " << o.o_hse_oid << dendl;
 
-  rc = hse_kvs_put(_collection_object_kvs, os, static_cast<void *>(key.get()),
-    klen1 + klen2 + klen3, nullptr, 0);
+  rc = HseStore::kv_update_obj_data_len(os, c, o, 0);
   if (rc) {
-    dout(10) << __func__ << " failed to put in _collection_object_kvs" << dendl;
+    dout(10) << __func__ << " failed to create object in _collection_object_kvs" << dendl;
     return rc;
   }
   o.o_exists = true;
@@ -2302,9 +2360,155 @@ int HseStore::statfs(struct store_statfs_t* buf0, osd_alert_list_t* alerts)
 
 /* Temporary hack, TODO */
 ObjectMap::ObjectMapIterator HseStore::get_omap_iterator(
-  CollectionHandle &c, 
-  const ghobject_t &oid) 
+  CollectionHandle &c,
+  const ghobject_t &oid)
 {
   return ObjectMap::ObjectMapIterator();
 }
 
+/*
+ * Build a key to use on the kvs _object_omap_kvs
+ */
+void HseStore::omap_hse_key(
+    hse_oid_t hse_oid,
+    const std::string& omap_key,
+    uint32_t omap_block_nb,
+    std::string *omap_block_hse_key)
+{
+  omap_block_hse_key->clear();
+  _key_encode_u64(hse_oid, omap_block_hse_key);
+  omap_block_hse_key->append(omap_key);
+  _key_encode_u32(omap_block_nb, omap_block_hse_key);
+}
+
+/*
+ * Remove/delete one k/v from an object omap.
+ */
+hse_err_t HseStore::kv_omap_rm_one_kv(
+    struct hse_kvdb_opspec *os,
+    Onode& o,
+    const std::string& omap_key)
+{
+  struct hse_kvs_cursor *cursor;
+  std::string omap_block_hse_key;
+  hse_err_t rc, rc1;
+  uint32_t omap_block_nb = 0;
+  size_t omap_block_hse_key_len;
+  const void *seek_found;
+  size_t seek_found_len;
+
+  //
+  // Create a cursor with (hse oid + omap key) as filter.
+  //
+  omap_hse_key(o.o_hse_oid, omap_key, omap_block_nb, &omap_block_hse_key);
+  omap_block_hse_key_len = omap_block_hse_key.length();
+  rc = hse_kvs_cursor_create(_object_omap_kvs, os, (void *)omap_block_hse_key.c_str(),
+    omap_block_hse_key_len - OMAP_BLOCK_NB_LEN, &cursor);
+  if (rc) {
+    dout(10) << __func__ << " failed to create a cursor on object omap kvs" << dendl;
+    return rc;
+  }
+
+  //
+  // Iterate on the omap value blocks.
+  // No need to read them, seek is enough because we delete them.
+  //
+  while (true) {
+    rc = hse_kvs_cursor_seek_wrapper(cursor, os, omap_block_hse_key.c_str(),
+      omap_block_hse_key.length(), &seek_found, &seek_found_len);
+    if (rc) {
+      dout(10) << __func__ << " failed to seek to an omap data block" << dendl;
+      goto end;
+    }
+
+    if (!seek_found_len) {
+      goto end;
+    }
+
+    //
+    // Delete the k/v pair
+    //
+    rc = hse_kvs_delete(_object_omap_kvs, os, seek_found, seek_found_len);
+    if (rc) {
+      dout(10) << __func__ << " failed to delete an omap data block" << dendl;
+      goto end;
+    }
+
+
+    // Key for the next omap data block number
+    omap_block_hse_key.resize(omap_block_hse_key_len - OMAP_BLOCK_NB_LEN);
+    _key_encode_u32(++omap_block_nb, &omap_block_hse_key);
+  }
+
+end:
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
+    dout(10) << __func__ << " failed to destroy cursor" << dendl;
+  }
+  return rc ? rc : rc1;
+}
+
+hse_err_t HseStore::_omap_rmkeys(CollectionRef& c, Onode& o, bufferlist& keys_bl)
+{
+  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << " exists " << o.o_exists << dendl;
+
+  if (!o.o_exists)
+    return ENOENT;
+
+  auto p = keys_bl.cbegin();
+  uint32_t num;
+  decode(num, p);
+  while (num--) {
+    string key;
+    decode(key, p);
+    // o->omap.erase(key);
+  }
+  return 0;
+}
+
+
+/*
+ * opspec->kop_txn must be NULL when hse_kvs_cursor_seek() is called (Gaurav)
+ */
+hse_err_t HseStore::hse_kvs_cursor_seek_wrapper(
+    struct hse_kvs_cursor * cursor,
+    struct hse_kvdb_opspec *opspec,
+    const void *            key,
+    size_t                  key_len,
+    const void **           found,
+    size_t *                found_len)
+{
+
+  hse_err_t rc;
+  struct hse_kvdb_txn *kop_txn_sav;
+
+  kop_txn_sav = opspec->kop_txn;
+  opspec->kop_txn = NULL;
+  rc = hse_kvs_cursor_seek(cursor, opspec, key, key_len, found, found_len);
+  opspec->kop_txn = kop_txn_sav;
+  return rc;
+}
+
+/*
+ * opspec->kop_txn must be NULL when hse_kvs_cursor_read() is called (Gaurav)
+ */
+hse_err_t HseStore::hse_kvs_cursor_read_wrapper(
+    struct hse_kvs_cursor * cursor,
+    struct hse_kvdb_opspec *opspec,
+    const void **           key,
+    size_t *                key_len,
+    const void **           val,
+    size_t *                val_len,
+    bool *                  eof)
+{
+
+  hse_err_t rc;
+  struct hse_kvdb_txn *kop_txn_sav;
+
+  kop_txn_sav = opspec->kop_txn;
+  opspec->kop_txn = NULL;
+  rc = hse_kvs_cursor_read(cursor, opspec, key, key_len, val, val_len, eof);
+  opspec->kop_txn = kop_txn_sav;
+  return rc;
+}
