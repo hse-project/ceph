@@ -52,9 +52,9 @@ static constexpr std::string_view OBJECT_DATA_KVS_NAME = "object-data";
 static constexpr std::string_view OBJECT_XATTR_KVS_NAME = "object-xattr";
 static constexpr std::string_view OBJECT_OMAP_KVS_NAME = "object-omap";
 
-// Buffer used by Ceph write data operations.
-// If the write operation requires a read, this buffer is also used for the read.
-alignas(DATA_BLOCK_LEN) thread_local uint8_t odata_buf[DATA_BLOCK_LEN];
+// Buffer used for Ceph write operations (write(), omap value xattr value).
+// If the write operation requires a read (for merge), this buffer is also used for the read.
+alignas(1 << 12) thread_local uint8_t write_buf[OMAP_BLOCK_LEN];
 
 // Buffer used for Ceph read data operations.
 // It is always zero (never changed). It is used to return zeroes to Ceph without doing a copy.
@@ -231,6 +231,9 @@ void Syncer::kvdb_sync(HseStore *store)
   HseStore::Collection *c;
   bool needsync = false;
 
+
+  dout(10) << __func__ << " entering" << dendl;
+
   // Record for each collection, the latest committed before starting the sync.
   std::shared_lock<ceph::shared_mutex> l{store->coll_lock};
   for (auto const& [key, val] : store->coll_map) {
@@ -290,6 +293,433 @@ void Syncer::timer_cb(const boost::system::error_code& e, boost::asio::deadline_
 #pragma pop_macro("dout_prefix")
 #pragma pop_macro("dout_context")
 
+
+#pragma push_macro("dout_prefix")
+#pragma push_macro("dout_context")
+#undef dout_prefix
+#undef dout_context
+#define dout_prefix *_dout << "hsestore "
+#define dout_context this->_c->_store->cct
+//
+// OmapIteratorImpl functions
+//
+
+HseStore::OmapIteratorImpl::OmapIteratorImpl(CollectionRef c, Onode& o) : _c(c), _o(o),
+  _os(nullptr), _valid(false)
+{
+  hse_err_t rc;
+  std::string hse_key;
+
+  dout(10) << __func__ << " entering hse_oid " <<  _o.o_hse_oid << _o.o_oid << dendl;
+
+  _key_encode_u64(o.o_hse_oid, &hse_key);
+  rc = this->_c->_store->hse_kvs_cursor_create_wrapper(this->_c->_store->_object_omap_kvs,
+      this->_os, hse_key.c_str(), hse_key.length(), &(this->_cursor));
+  ceph_assert(!rc);
+}
+#pragma pop_macro("dout_prefix")
+#pragma pop_macro("dout_context")
+
+HseStore::OmapIteratorImpl::~OmapIteratorImpl()
+{
+  hse_err_t rc;
+
+  rc = hse_kvs_cursor_destroy(_cursor);
+  ceph_assert(!rc);
+}
+
+/*
+ * Read the key and value of one omap entry.
+ *
+ * The cursor passed in is limited to one Ceph object (aka one hse_oid).
+ * When entering this function, the cursor points:
+ *  - to the first block of an omap entry. OmapBlk0.already_read is false.
+ *  - or to the second block (block nb 1) of an omap entry. blk0.already_read is true
+ *    and "blk0" contains block 0 key and data.
+ *
+ * If "ceph_iterator" is true, it means we are in the context of a Ceph OmapIterator.
+ * If val_bl is null, then the caller doesn't need the omap entry value.
+ */
+hse_err_t HseStore::kv_omap_read_entry(
+    struct hse_kvdb_opspec *os,
+    struct hse_kvs_cursor *cursor,
+    bool ceph_iterator,
+    struct OmapBlk0 *blk0, // in/out
+    std::string& omap_key, // out
+    bufferlist* val_bl, // out
+    bool& found)
+{
+  found = true;
+  bool need_copy = true;
+  bool done = false;
+  std::string hse_key_str;
+  const char *hse_key;
+  size_t hse_key_len;
+  const char *hse_val;
+  size_t hse_val_len;
+  uint32_t block_nb = 0;;
+  hse_err_t rc;
+  bool eof;
+
+  dout(10) << __func__ << " entering"  << dendl;
+  if (val_bl)
+    val_bl->clear();
+
+  if (blk0->already_read) {
+    blk0->already_read = false;
+
+    // The first block has already been read, use the result of that read.
+
+    if (blk0->hse_val_len < OMAP_BLOCK_LEN) {
+      // Only one block for the value of this omap entry.
+      done = true;
+
+      if (ceph_iterator) {
+        // Ceph is going to use the value buffer (provided by Hse) only till it calls
+        // again ObjectMap::ObjectMapIterator.next() (that call hse_kvs_cursor_read()).
+        // So is safe to pass to Ceph the buffer allocated by hse.
+        need_copy = false;
+      }
+    }
+    if (val_bl) {
+      if (need_copy) {
+        // Copy takes place
+        val_bl->append(blk0->hse_val, blk0->hse_val_len);
+      } else {
+        // No copy.
+        bufferptr ptr(buffer::create_static(blk0->hse_val_len, (char *)blk0->hse_val));
+        val_bl->append(ptr);
+      }
+    }
+
+    // Extract the omap key from the hse key.
+    hse_key_str.assign(blk0->hse_key);
+    block_nb = HseStore::object_omap_hse_key2block_nb(hse_key_str);
+    ceph_assert(!block_nb);
+    HseStore::object_omap_hse_key2omap_key(hse_key_str, omap_key);
+
+  } else {
+    // Read the first block of the omap entry
+    rc = hse_kvs_cursor_read_wrapper(cursor, os, reinterpret_cast<const void **>(&hse_key),
+      &hse_key_len, reinterpret_cast<const void **>(&hse_val), &hse_val_len, &eof);
+    if (rc) {
+      dout(10) << __func__ << " failed to cursor read the first block rc " <<
+	hse_err_to_errno(rc) << dendl;
+      return rc;
+    }
+    if (eof) {
+      done = true;
+      found = false;
+    } else {
+      // Extract the omap key from the hse key.
+      hse_key_str.assign(hse_key, hse_key_len);
+      block_nb = HseStore::object_omap_hse_key2block_nb(hse_key_str);
+      ceph_assert(!block_nb);
+      HseStore::object_omap_hse_key2omap_key(hse_key_str, omap_key);
+
+      if (hse_val_len < OMAP_BLOCK_LEN) {
+	done = true;
+        if (ceph_iterator) {
+          // Ceph is going to use the value buffer (provided by Hse) only till it calls
+          // again ObjectMap::ObjectMapIterator.next() (that call hse_kvs_cursor_read()).
+          // So is safe to pass to Ceph the buffer allocated by hse.
+          need_copy = false;
+        }
+      }
+      if (val_bl) {
+        if (need_copy) {
+          // Copy takes place
+          val_bl->append(hse_val, hse_val_len);
+        } else {
+          // No copy.
+          bufferptr ptr(buffer::create_static(hse_val_len, (char *)hse_val));
+          val_bl->append(ptr);
+        }
+      }
+    }
+  }
+
+  //
+  // The block 0 is read, read following blocks of the same omap entry if they exist.
+  //
+
+  for (block_nb = 1; !done; block_nb++) {
+    std::string hse_key_blk0_str;
+
+    if (block_nb == 1) {
+      // Save hse key of block 0 to comapre it the following hse keys.
+      hse_key_blk0_str.assign(hse_key_str);
+    }
+
+    rc = hse_kvs_cursor_read_wrapper(cursor, os, reinterpret_cast<const void **>(&hse_key),
+      &hse_key_len, reinterpret_cast<const void **>(&hse_val), &hse_val_len, &eof);
+    if (rc) {
+      dout(10) << __func__ << " failed to cursor read the block nb " << block_nb <<
+	" rc " << hse_err_to_errno(rc) << dendl;
+      return rc;
+    }
+    if (eof) {
+      done = true;
+    } else {
+      hse_key_str.assign(hse_key, hse_key_len);
+
+      //
+      // Compare the first part of the hse key (without the ending block number)
+      // to know if we are still on the same omap entry.
+      //
+      if (hse_key_blk0_str.compare(0, hse_key_blk0_str.length() - sizeof(uint32_t),
+	    hse_key_str, 0, hse_key_str.length() - sizeof(uint32_t))) {
+
+	//
+	// We ended up on the first block of the next omap entry.
+	// We have to stop and save what was read from this first block, it will be used
+	// next time this function is called to get the next omap entry.
+	//
+
+	ceph_assert(HseStore::object_omap_hse_key2block_nb(hse_key_str) == 0);
+
+	done = true;
+
+	blk0->already_read = true;
+        blk0->hse_key.assign(hse_key, hse_key_len);
+	blk0->hse_val = hse_val;
+	blk0->hse_val_len = hse_val_len;
+
+      } else {
+	//
+	// We are still on the same omap entry.
+	//
+	ceph_assert(block_nb == HseStore::object_omap_hse_key2block_nb(hse_key_str));
+
+	if (val_bl) {
+	  // Copy takes place
+	  val_bl->append(hse_val, hse_val_len);
+	}
+
+	if (hse_val_len < OMAP_BLOCK_LEN) {
+	  done = true;
+	}
+      }
+    }
+  }
+  dout(10) << __func__ << " found " << found << " return omap entry "  << omap_key << dendl;
+  return 0;
+}
+
+/*
+ * Create a kvs cursor in kvs _object_omap_kvs that is restricted to a particular object
+ * and have it point on block 0 of the first omap entry of the object (skipping the omap header).
+ */
+hse_err_t HseStore::kv_omap_create_hse_cursor(
+    struct hse_kvdb_opspec *os,
+    Onode& o,
+    struct hse_kvs_cursor **cursor)
+{
+  hse_err_t rc;
+  std::string hse_key;
+
+  dout(10) << __func__ << " entering"  << dendl;
+
+  ceph_assert(o.o_exists);
+  _key_encode_u64(o.o_hse_oid, &hse_key);
+  rc = hse_kvs_cursor_create_wrapper(_object_omap_kvs, os, hse_key.c_str(), hse_key.length(),
+      cursor);
+  if (rc)
+    return rc;
+
+  // Need to skip the omap header whose hse key is only the hse_oid_t (8 bytes)
+  // Add a zero after the hse_oid_t
+  hse_key.append(1, 0);
+
+  rc = hse_kvs_cursor_seek_wrapper(*cursor, os, hse_key.c_str(), hse_key.length(),
+      nullptr, nullptr);
+
+  if (rc)
+    hse_kvs_cursor_destroy(*cursor);
+
+  return rc;
+}
+
+#pragma push_macro("dout_prefix")
+#pragma push_macro("dout_context")
+#undef dout_prefix
+#undef dout_context
+#define dout_prefix *_dout << "hsestore "
+#define dout_context _c->_store->cct
+
+int HseStore::OmapIteratorImpl::seek_to_first()
+{
+  hse_err_t rc;
+  std::string hse_key;
+  std::string hse_key_found;
+  const char *seek_found;
+  size_t seek_found_len;
+
+  dout(10) << __func__ << " entering"  << dendl;
+
+  _valid = false;
+  _blk0.already_read = false;
+
+  _key_encode_u64(_o.o_hse_oid, &hse_key);
+
+  // Need to skip the omap header whose hse key is only the hse_oid_t (8 bytes)
+  // Add a zero after the hse_oid_t
+  hse_key.append(1, 0);
+
+  rc = _c->_store->hse_kvs_cursor_seek_wrapper(_cursor, _os, hse_key.c_str(), hse_key.length(),
+      (const void **)&seek_found, &seek_found_len);
+
+  if (!rc)
+    goto end;
+
+  // Read the omap entry pointed by the cursor.
+  if (seek_found_len) {
+    bool found = false;
+
+    hse_key_found.assign(seek_found, seek_found_len);
+    ceph_assert(HseStore::object_omap_hse_key2block_nb(hse_key_found) == 0);
+
+    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+    if (rc)
+      goto end;
+
+    ceph_assert(found);
+    _valid = true;
+  }
+
+end:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::OmapIteratorImpl::upper_bound(const string &after)
+{
+  hse_err_t rc;
+  std::string hse_key;
+  const char *seek_found;
+  size_t seek_found_len;
+  std::string hse_key_found;
+
+  dout(10) << __func__ << " entering"  << dendl;
+
+  _valid = false;
+  _blk0.already_read = false;
+
+  _key_encode_u64(_o.o_hse_oid, &hse_key);
+  hse_key.append(after); // append the omap key after the hse_oid
+  _key_encode_u32(MAX_BLOCK_NB, &hse_key); // append block number 0xFFFFFFFF
+
+
+  // The seek is not going to find the block number 0xFFFFFFFF and is going to land on
+  // the block 0 of the next omap entry.
+  rc = _c->_store->hse_kvs_cursor_seek_wrapper(_cursor, _os, hse_key.c_str(), hse_key.length(),
+      (const void **)&seek_found, &seek_found_len);
+
+  if (!rc)
+    goto end;
+
+  // Read the omap entry pointed by the cursor.
+  if (seek_found_len) {
+    bool found = false;
+
+    hse_key_found.assign(seek_found, seek_found_len);
+    ceph_assert(HseStore::object_omap_hse_key2block_nb(hse_key_found) == 0);
+
+    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+    if (rc)
+      goto end;
+
+    ceph_assert(found);
+    std::string omap_key;
+    _valid = true;
+  }
+
+end:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::OmapIteratorImpl::lower_bound(const string &to)
+{
+  hse_err_t rc;
+  std::string hse_key;
+  const char *seek_found;
+  size_t seek_found_len;
+  std::string hse_key_found;
+
+  dout(10) << __func__ << " entering"  << dendl;
+
+  _valid = false;
+  _blk0.already_read = false;
+
+  _key_encode_u64(_o.o_hse_oid, &hse_key);
+  hse_key.append(to); // append the omap key after the hse_oid
+
+  rc = _c->_store->hse_kvs_cursor_seek_wrapper(_cursor, _os, hse_key.c_str(), hse_key.length(),
+      (const void **)&seek_found, &seek_found_len);
+  if (!rc)
+    goto end;
+
+  // Read the omap entry pointed by the cursor.
+  if (seek_found_len) {
+    bool found = false;
+
+    hse_key_found.assign(seek_found, seek_found_len);
+    ceph_assert(HseStore::object_omap_hse_key2block_nb(hse_key_found) == 0);
+
+    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+    if (rc)
+      goto end;
+
+    ceph_assert(found);
+    _valid = true;
+  }
+
+end:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+bool HseStore::OmapIteratorImpl::valid()
+{
+  dout(10) << __func__ << " entering"  << dendl;
+
+  return _valid;
+}
+
+int HseStore::OmapIteratorImpl::next()
+{
+  hse_err_t rc;
+  bool found;
+
+  dout(10) << __func__ << " entering"  << dendl;
+
+  _valid = false;
+
+  rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+  if (rc)
+      goto end;
+
+  if (found)
+    _valid = true;
+end:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+string HseStore::OmapIteratorImpl::key()
+{
+  dout(10) << __func__ << " entering"  << dendl;
+
+  ceph_assert(_valid);
+  return _omap_key;
+}
+
+bufferlist HseStore::OmapIteratorImpl::value()
+{
+  dout(10) << __func__ << " entering"  << dendl;
+
+  ceph_assert(_valid);
+  return _value;
+}
+#pragma pop_macro("dout_prefix")
+#pragma pop_macro("dout_context")
 
 //
 // HseStore functions
@@ -370,7 +800,7 @@ int HseStore::collection_empty(CollectionHandle &c, bool *empty)
   coll_t2key(cct, c->cid, &coll_tkey);
 
   struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(_collection_object_kvs, nullptr, coll_tkey.c_str(),
+  rc = hse_kvs_cursor_create_wrapper(_collection_object_kvs, nullptr, coll_tkey.c_str(),
     coll_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while checking if collection ("
@@ -495,7 +925,7 @@ hse_err_t HseStore::split_collection(
   std::string newcid_tkey;
   coll_t2key(cct, new_cid, &newcid_tkey);
 
-  rc = hse_kvs_cursor_create(_collection_object_kvs, os, oldcid_tkey.c_str(),
+  rc = hse_kvs_cursor_create_wrapper(_collection_object_kvs, os, oldcid_tkey.c_str(),
     oldcid_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while splitting collection ("
@@ -576,7 +1006,7 @@ hse_err_t HseStore::merge_collection(
   std::string new_cid_tkey;
   coll_t2key(cct, new_cid, &new_cid_tkey);
 
-  rc = hse_kvs_cursor_create(_collection_object_kvs, os, old_cid_tkey.c_str(),
+  rc = hse_kvs_cursor_create_wrapper(_collection_object_kvs, os, old_cid_tkey.c_str(),
     old_cid_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor while merging collections (" <<
@@ -729,7 +1159,7 @@ int HseStore::mount()
   }
 
   struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(_collection_kvs, nullptr, nullptr, 0, &cursor);
+  rc = hse_kvs_cursor_create_wrapper(_collection_kvs, nullptr, nullptr, 0, &cursor);
   if (rc) {
     dout(10) << " failed to create a cursor for populating the in-memory collection map" << dendl;
     goto end;
@@ -994,15 +1424,37 @@ void HseStore::offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset,
   ceph_assert(key->length() == OBJECT_DATA_KEY_LEN);
 }
 
-// Return the object data block number from the key used in kvs _object_data_kvs (hse_oid +
+// Return the object data block number from the hse key used in kvs _object_data_kvs (hse_oid +
 // encoded block number)
-uint32_t HseStore::object_data_key2block_nb(
-    std::string& object_data_key)
+uint32_t HseStore::object_data_hse_key2block_nb(
+    std::string& object_data_hse_key)
 {
   uint32_t block_nb;
 
-  _key_decode_u32(object_data_key.c_str() + sizeof(hse_oid_t), &block_nb);
+  _key_decode_u32(object_data_hse_key.c_str() + sizeof(hse_oid_t), &block_nb);
   return block_nb;
+}
+
+// Return the omap value block number from the hse key used in kvs _object_omap_kvs
+// (hse_oid + ceph omap entry key + encoded block number)
+uint32_t HseStore::object_omap_hse_key2block_nb(
+    std::string& object_omap_hse_key)
+{
+  uint32_t block_nb;
+
+  _key_decode_u32(object_omap_hse_key.c_str() + object_omap_hse_key.length() -
+      sizeof(uint32_t), &block_nb);
+  return block_nb;
+}
+
+// Return the ceph omap key from the hse key used in kvs _object_omap_kvs
+// (hse_oid + ceph omap entry key + encoded block number)
+void HseStore::object_omap_hse_key2omap_key(
+    std::string& object_omap_kse_key,
+    std::string& omap_key)
+{
+  omap_key = object_omap_kse_key.substr(sizeof(hse_oid_t),
+      object_omap_kse_key.length() - sizeof(hse_oid_t) - sizeof(uint32_t));
 }
 
 // Append buffers (each block sized and zero filled) in the buffer list "bl".
@@ -1160,17 +1612,8 @@ hse_err_t HseStore::kv_read_data(
   //
   struct hse_kvs_cursor *cursor;
 
-  // to remove
-  struct hse_kvdb_txn *kop_txn_sav;
-  kop_txn_sav = os->kop_txn;
-  os->kop_txn = NULL;
-
-  rc = hse_kvs_cursor_create(_object_data_kvs, os, (void *)(&o.o_hse_oid),
+  rc = hse_kvs_cursor_create_wrapper(_object_data_kvs, os, (void *)(&o.o_hse_oid),
     sizeof(hse_oid_t), &cursor);
-
-  // to remove
-  os->kop_txn = kop_txn_sav;
-
   if (rc) {
     dout(10) << __func__ << " failed to create a cursor data" << dendl;
     return rc;
@@ -1220,7 +1663,7 @@ hse_err_t HseStore::kv_read_data(
     } else {
       ceph_assert(cursor_block_key_len == OBJECT_DATA_KEY_LEN);
       ceph_assert(val_len == DATA_BLOCK_LEN);
-      cursor_block_nb = object_data_key2block_nb(cursor_block_key);
+      cursor_block_nb = object_data_hse_key2block_nb(cursor_block_key);
       if (cursor_block_nb > end_block_nb + 1) {
 	cursor_block_nb  = end_block_nb + 1;
       }
@@ -1252,7 +1695,19 @@ hse_err_t HseStore::kv_read_data(
     //
     // Attach the data of the block at cursor position to the buffer list bl
     //
-    bufferptr ptr(buffer::create_static(DATA_BLOCK_LEN, (char *)val));
+
+    // We need to do a copy until hse read cursor allows us to provide a buffer.
+
+    // Allocate a full data block.
+    bufferptr ptr(buffer::create_page_aligned(DATA_BLOCK_LEN));
+    // Copy the data block we got from hse into ptr.
+    ceph_assert(val_len == DATA_BLOCK_LEN);
+    ptr.append((char *)val, DATA_BLOCK_LEN);
+
+    // Can't do the below because the buffer "val" is reclaimed by hse as soon as cusor read
+    // goes to the next block....
+    // bufferptr ptr(buffer::create_static(DATA_BLOCK_LEN, (char *)val));
+
     if (cursor_block_nb == start_block_nb) {
       // This is the first block returned.
       // Adjust it start offset.
@@ -1367,7 +1822,7 @@ hse_err_t HseStore::kv_write_data(
       //
 
       rc = hse_kvs_get(_object_data_kvs, os, object_data_key.c_str(), object_data_key.length(),
-	  &found, odata_buf, DATA_BLOCK_LEN, &val_len);
+	  &found, write_buf, DATA_BLOCK_LEN, &val_len);
       if (rc) {
         dout(10) << __func__ << " failed to get object data block " << c->cid << dendl;
         goto end;
@@ -1376,21 +1831,21 @@ hse_err_t HseStore::kv_write_data(
       if (found) {
 	ceph_assert(val_len == DATA_BLOCK_LEN);
 	//
-	// Merge new data with old data read in the odata_buf.
+	// Merge new data with old data read in the write_buf.
 	//
-	i.copy(to_copy_in_block, (char *)odata_buf + block_wr_offset);
+	i.copy(to_copy_in_block, (char *)write_buf + block_wr_offset);
       } else {
 	uint32_t copied;
 
 	// Block doesn't exist yet, no need to merge, pad with zeroes.
 	if (block_wr_offset)
-	  memset(odata_buf, 0, block_wr_offset);
-	i.copy(to_copy_in_block, (char *)odata_buf + block_wr_offset);
+	  memset(write_buf, 0, block_wr_offset);
+	i.copy(to_copy_in_block, (char *)write_buf + block_wr_offset);
 	copied = block_wr_offset + to_copy_in_block;
 	if (copied < DATA_BLOCK_LEN)
-	  memset(odata_buf + copied, 0, DATA_BLOCK_LEN - copied);
+	  memset(write_buf + copied, 0, DATA_BLOCK_LEN - copied);
       }
-      wb = odata_buf;
+      wb = write_buf;
 
     } else {
       size_t got;
@@ -1412,9 +1867,9 @@ hse_err_t HseStore::kv_write_data(
 	wb = ceph_ptr;
       } else {
 	// Ceph buffer not big enough we need to do a copy
-	memcpy(odata_buf, ceph_ptr, got);
-	i.copy(DATA_BLOCK_LEN - got, (char *)odata_buf + got);
-	wb = odata_buf;
+	memcpy(write_buf, ceph_ptr, got);
+	i.copy(DATA_BLOCK_LEN - got, (char *)write_buf + got);
+	wb = write_buf;
       }
     }
 
@@ -1735,19 +2190,19 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	r = _omap_clear(txc, c, o);
       }
       break;
+#endif
     case Transaction::OP_OMAP_SETKEYS:
       {
 	bufferlist aset_bl;
         i.decode_attrset_bl(&aset_bl);
-	r = _omap_setkeys(txc, c, o, aset_bl);
+	rc = HseStore::_omap_setkeys(&os, c, o, aset_bl);
       }
       break;
-#endif
     case Transaction::OP_OMAP_RMKEYS:
       {
 	bufferlist keys_bl;
         i.decode_keyset_bl(&keys_bl);
-	rc = HseStore::_omap_rmkeys(c, o, keys_bl);
+	rc = HseStore::_omap_rmkeys(&os, c, o, keys_bl);
       }
       break;
 #if 0
@@ -2119,7 +2574,7 @@ hse_err_t HseStore::ghobject_t2hse_oid(const coll_t &cid, const ghobject_t &oid,
   memset(filt_max.get() + filt_min_len, 0xFF, sizeof(HseStore::hse_oid_t));
 
   struct hse_kvs_cursor *cursor;
-  rc = hse_kvs_cursor_create(_collection_object_kvs, nullptr, coll_tkey.c_str(),
+  rc = hse_kvs_cursor_create_wrapper(_collection_object_kvs, nullptr, coll_tkey.c_str(),
       coll_tkey.size(), &cursor);
   if (rc) {
     dout(10) << " failed to create cursor when check existence of object ("
@@ -2358,12 +2813,23 @@ int HseStore::statfs(struct store_statfs_t* buf0, osd_alert_list_t* alerts)
   return 0;
 }
 
-/* Temporary hack, TODO */
 ObjectMap::ObjectMapIterator HseStore::get_omap_iterator(
-  CollectionHandle &c,
+  CollectionHandle &ch,
   const ghobject_t &oid)
 {
-  return ObjectMap::ObjectMapIterator();
+  Onode o;
+  dout(10) << __func__ << " " << ch->cid << " " << oid << dendl;
+
+
+  Collection *c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    return ObjectMap::ObjectMapIterator(); // nullptr
+  }
+
+
+  return ObjectMap::ObjectMapIterator(new OmapIteratorImpl(c, o));
 }
 
 /*
@@ -2382,9 +2848,9 @@ void HseStore::omap_hse_key(
 }
 
 /*
- * Remove/delete one k/v from an object omap.
+ * Remove/delete one entry from an object omap.
  */
-hse_err_t HseStore::kv_omap_rm_one_kv(
+hse_err_t HseStore::kv_omap_rm_entry(
     struct hse_kvdb_opspec *os,
     Onode& o,
     const std::string& omap_key)
@@ -2397,12 +2863,15 @@ hse_err_t HseStore::kv_omap_rm_one_kv(
   const void *seek_found;
   size_t seek_found_len;
 
+  dout(10) << __func__ << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << dendl;
+
   //
   // Create a cursor with (hse oid + omap key) as filter.
   //
   omap_hse_key(o.o_hse_oid, omap_key, omap_block_nb, &omap_block_hse_key);
   omap_block_hse_key_len = omap_block_hse_key.length();
-  rc = hse_kvs_cursor_create(_object_omap_kvs, os, (void *)omap_block_hse_key.c_str(),
+  rc = hse_kvs_cursor_create_wrapper(_object_omap_kvs, os, (void *)omap_block_hse_key.c_str(),
     omap_block_hse_key_len - OMAP_BLOCK_NB_LEN, &cursor);
   if (rc) {
     dout(10) << __func__ << " failed to create a cursor on object omap kvs" << dendl;
@@ -2448,7 +2917,11 @@ end:
   return rc ? rc : rc1;
 }
 
-hse_err_t HseStore::_omap_rmkeys(CollectionRef& c, Onode& o, bufferlist& keys_bl)
+hse_err_t HseStore::_omap_rmkeys(
+    struct hse_kvdb_opspec *os,
+    CollectionRef& c,
+    Onode& o,
+    bufferlist& keys_bl)
 {
   dout(10) << __func__ << " " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
 	   << " exists " << o.o_exists << dendl;
@@ -2460,11 +2933,405 @@ hse_err_t HseStore::_omap_rmkeys(CollectionRef& c, Onode& o, bufferlist& keys_bl
   uint32_t num;
   decode(num, p);
   while (num--) {
+    hse_err_t rc;
+
     string key;
     decode(key, p);
-    // o->omap.erase(key);
+    rc = HseStore::kv_omap_rm_entry(os, o, key);
+    if (rc) {
+      dout(10) << __func__ << " failed to remove one omap k/v " << c->cid << " "
+	<< *o.o_oid << " hse_oid " << o.o_hse_oid << dendl;
+      return rc;
+    }
   }
   return 0;
+}
+
+hse_err_t HseStore::kv_omap_put(
+  struct hse_kvdb_opspec *os,
+  CollectionRef& c,
+  Onode& o,
+  std::string& omap_key,
+  bufferlist& omap_value)
+{
+  hse_err_t rc;
+  uint32_t block_nb;
+  size_t left = omap_value.length();
+  bufferlist::iterator iter(&omap_value);
+  size_t in_buffer;
+  std::string omap_block_hse_key;
+  size_t omap_block_hse_key_len;
+
+  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << dendl;
+
+  // The hse key is hse_oid + omap_key + block number
+  omap_hse_key(o.o_hse_oid, omap_key, 0, &omap_block_hse_key);
+  omap_block_hse_key_len = omap_block_hse_key.length();
+
+  // Loop on the omap blocks
+  for (block_nb = 0; left ; block_nb++, left -= in_buffer) {
+    uint8_t *ceph_ptr;
+    size_t got;
+    uint8_t *wb;
+
+    in_buffer = OMAP_BLOCK_LEN;
+    if (in_buffer > left)
+      in_buffer = left;
+
+    // Copy in an intermediate buffer if needed
+    got = iter.get_ptr_and_advance(in_buffer, (const char**)&ceph_ptr);
+    ceph_assert(got <= in_buffer);
+    if (got == in_buffer) {
+      // No data copy!
+      wb = ceph_ptr;
+    } else {
+      // Ceph buffer not big enough, we need to do a copy
+      memcpy(write_buf, ceph_ptr, got);
+      iter.copy(in_buffer - got, (char *)write_buf + got);
+      wb = write_buf;
+    }
+
+    // Compute the hse key for the omap value block number
+    omap_block_hse_key.resize(omap_block_hse_key_len - OMAP_BLOCK_NB_LEN);
+    _key_encode_u32(block_nb, &omap_block_hse_key);
+    rc = hse_kvs_put(_object_omap_kvs, os, omap_block_hse_key.c_str(),
+	omap_block_hse_key.length(), wb, in_buffer);
+    if (rc) {
+      dout(10) << __func__ << " failed to put " << c->cid << " " << *o.o_oid << " hse_oid "
+	<< o.o_hse_oid << dendl;
+      return rc;
+    }
+  }
+  return 0;
+}
+
+hse_err_t HseStore::_omap_setkeys(
+    struct hse_kvdb_opspec *os,
+    CollectionRef& c,
+    Onode& o,
+    bufferlist& keys_bl)
+{
+  hse_err_t rc;
+
+  dout(10) << __func__ << " " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << " exists " << o.o_exists << dendl;
+
+  if (!o.o_exists)
+    return ENOENT;
+
+  auto p = keys_bl.cbegin();
+  uint32_t num;
+  decode(num, p);
+  while (num--) {
+    string key;
+    bufferlist value;
+
+    decode(key, p);
+    decode(value, p);
+    rc = HseStore::kv_omap_put(os, c, o, key, value);
+    if (rc) {
+      dout(10) << __func__ << " " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << " rc " << rc << dendl;
+      return rc;
+    }
+  }
+  return 0;
+}
+
+/*
+ * If there is no omap header, it is not an error. 0 is returned and "header" is not updated.
+ */
+hse_err_t HseStore::kv_omap_header_read(
+    struct hse_kvdb_opspec *os,
+    Onode& o,
+    ceph::buffer::list *header,
+    bool& found)
+{
+  std::string hse_key;
+  size_t val_len;
+  hse_err_t rc;
+
+  dout(10) << __func__ << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
+	   << dendl;
+
+  found = false;
+
+  // The hse key for the omap header is simply the hse_oid_t
+  _key_encode_u64(o.o_hse_oid, &hse_key);
+
+
+  // Get the omap header size.
+  rc = hse_kvs_get(_object_omap_kvs, os, hse_key.c_str(), hse_key.length(), &found,
+      nullptr, 0, &val_len);
+
+  if (rc)
+    return rc;
+
+  if (!found) {
+    // The object has no omap header. It not an error.
+    return 0;
+  }
+
+  {
+    bufferptr ptr(val_len); // allocate Ceph buffer
+    rc = hse_kvs_get(_object_omap_kvs, os, hse_key.c_str(), hse_key.length(), &found,
+        ptr.c_str(), ptr.length(), &val_len);
+    if (rc)
+     return rc;
+
+    ceph_assert(found);
+    ceph_assert(ptr.length() == val_len);
+    header->clear();
+    header->append(ptr);
+  }
+  return 0;
+}
+
+
+int HseStore::omap_get_header(CollectionHandle &ch, const ghobject_t &oid,
+    ceph::buffer::list *header, bool allow_eio)
+{
+  hse_err_t rc;
+  Onode o;
+  bool found;
+
+  dout(10) << __func__ << " " << oid << dendl;
+
+  Collection *c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    return -ENOENT;
+  }
+
+  rc = HseStore::kv_omap_header_read(nullptr, o, header, found);
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::omap_get_keys(
+    CollectionHandle &ch,
+    const ghobject_t &oid,
+    std::set<std::string> *keys)
+{
+  struct hse_kvs_cursor *cursor;
+  struct OmapBlk0 blk0;
+  std::string omap_key;
+  bool found;
+  Onode o;
+  hse_err_t rc;
+
+  dout(10) << __func__ << " " << oid << dendl;
+
+  Collection *c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    return -ENOENT;
+  }
+
+  rc = kv_omap_create_hse_cursor(nullptr, o, &cursor);
+  if (rc) {
+    dout(10) << __func__ << " kv_omap_create_hse_cursor() failed " << oid << dendl;
+    return -hse_err_to_errno(rc);
+  }
+
+  do {
+    rc = kv_omap_read_entry(nullptr, cursor, false, &blk0, omap_key, nullptr, found);
+    if (rc)
+      goto end;
+    if (found)
+      keys->insert(omap_key);
+  } while (!found);
+
+end:
+  hse_kvs_cursor_destroy(cursor);
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::omap_get_values(
+    CollectionHandle &ch,
+    const ghobject_t &oid,
+    const std::set<std::string> &keys,
+    std::map<std::string, ceph::buffer::list> *out)
+{
+  struct hse_kvs_cursor *cursor;
+  struct OmapBlk0 blk0;
+  bool found;
+  Onode o;
+  hse_err_t rc;
+  const char *seek_found;
+  size_t seek_found_len;
+
+  dout(10) << __func__ << " " << ch->cid << " " << oid << dendl;
+
+  Collection *c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    return -ENOENT;
+  }
+
+  rc = kv_omap_create_hse_cursor(nullptr, o, &cursor);
+  if (rc) {
+    dout(10) << __func__ << " kv_omap_create_hse_cursor() failed " << oid << dendl;
+    return -hse_err_to_errno(rc);
+  }
+
+  //
+  // Loop on the input keys
+  //
+
+  for(auto key : keys) {
+    bufferlist val_bl;
+    std::string hse_key;
+    std::string omap_key;
+
+    blk0.already_read = false;
+    hse_key.clear();
+
+    omap_hse_key(o.o_hse_oid, key, 0, &hse_key);
+
+    rc = HseStore::hse_kvs_cursor_seek_wrapper(cursor, nullptr, hse_key.c_str(), hse_key.length(),
+      (const void **)&seek_found, &seek_found_len);
+    if (!rc)
+      goto end;
+
+    if (!seek_found_len)
+      continue;
+
+    if (hse_key.compare(seek_found))
+      continue;
+
+    rc = kv_omap_read_entry(nullptr, cursor, false, &blk0, omap_key, &val_bl, found);
+    if (rc)
+      goto end;
+
+    ceph_assert(found);
+    ceph_assert(key.compare(omap_key) == 0);
+    out->insert({key, val_bl});
+  }
+
+end:
+  hse_kvs_cursor_destroy(cursor);
+
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::omap_check_keys(
+    CollectionHandle &ch,
+    const ghobject_t &oid,
+    const std::set<std::string> &keys,
+    std::set<std::string> *out)
+{
+  hse_err_t rc = 0;
+  Onode o;
+  bool found;
+
+  dout(10) << __func__ << " " << ch->cid << " " << oid << dendl;
+
+  Collection *c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    return -ENOENT;
+  }
+  //
+  // Loop on the input keys
+  //
+
+  for(auto key : keys) {
+    std::string hse_key;
+    size_t val_len;
+
+    omap_hse_key(o.o_hse_oid, key, 0, &hse_key);
+
+    rc = hse_kvs_get(_object_omap_kvs, nullptr, hse_key.c_str(), hse_key.length(), &found,
+      nullptr, 0, &val_len);
+    if (rc)
+      goto end;
+
+    if (found)
+      out->insert(key);
+  }
+
+end:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+/*
+ */
+int HseStore::omap_get(CollectionHandle &ch, const ghobject_t &oid, ceph::buffer::list *header,
+    std::map<std::string, ceph::buffer::list> *out)
+{
+  hse_err_t rc;
+  Onode o;
+  bool found;
+  struct OmapBlk0 blk0;
+  struct hse_kvs_cursor *cursor;
+
+  dout(10) << __func__ << " " << ch->cid << " " << oid << dendl;
+
+  Collection *c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    return -ENOENT;
+  }
+
+  rc = HseStore::kv_omap_header_read(nullptr, o, header, found);
+  if (rc) {
+    dout(10) << __func__ << " kv_omap_create_haeder_read() failed " << oid << dendl;
+    return -hse_err_to_errno(rc);
+  }
+
+  rc = kv_omap_create_hse_cursor(nullptr, o, &cursor);
+  if (rc) {
+    dout(10) << __func__ << " kv_omap_create_hse_cursor() failed " << oid << dendl;
+    return -hse_err_to_errno(rc);
+  }
+
+  do {
+    bufferlist val_bl;
+    std::string omap_key;
+
+    rc = kv_omap_read_entry(nullptr, cursor, false, &blk0, omap_key, &val_bl, found);
+    if (rc)
+      goto end;
+    if (found)
+      out->insert({omap_key, val_bl});
+  } while (!found);
+
+end:
+  hse_kvs_cursor_destroy(cursor);
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+/*
+ * opspec->kop_txn must be NULL when hse_kvs_cursor_create() is called
+ */
+hse_err_t HseStore::hse_kvs_cursor_create_wrapper(
+    struct hse_kvs *        kvs,
+    struct hse_kvdb_opspec *opspec,
+    const void *            filt,
+    size_t                  filt_len,
+    struct hse_kvs_cursor **cursor)
+{
+
+  hse_err_t rc;
+  struct hse_kvdb_txn *kop_txn_sav;
+
+  if (opspec) {
+    kop_txn_sav = opspec->kop_txn;
+    opspec->kop_txn = NULL;
+  }
+  rc = hse_kvs_cursor_create(kvs, opspec, filt, filt_len, cursor);
+  if (opspec) {
+    opspec->kop_txn = kop_txn_sav;
+  }
+  return rc;
 }
 
 
@@ -2483,10 +3350,14 @@ hse_err_t HseStore::hse_kvs_cursor_seek_wrapper(
   hse_err_t rc;
   struct hse_kvdb_txn *kop_txn_sav;
 
-  kop_txn_sav = opspec->kop_txn;
-  opspec->kop_txn = NULL;
+  if (opspec) {
+    kop_txn_sav = opspec->kop_txn;
+    opspec->kop_txn = NULL;
+  }
   rc = hse_kvs_cursor_seek(cursor, opspec, key, key_len, found, found_len);
-  opspec->kop_txn = kop_txn_sav;
+  if (opspec) {
+    opspec->kop_txn = kop_txn_sav;
+  }
   return rc;
 }
 
@@ -2506,9 +3377,13 @@ hse_err_t HseStore::hse_kvs_cursor_read_wrapper(
   hse_err_t rc;
   struct hse_kvdb_txn *kop_txn_sav;
 
-  kop_txn_sav = opspec->kop_txn;
-  opspec->kop_txn = NULL;
+  if (opspec) {
+    kop_txn_sav = opspec->kop_txn;
+    opspec->kop_txn = NULL;
+  }
   rc = hse_kvs_cursor_read(cursor, opspec, key, key_len, val, val_len, eof);
-  opspec->kop_txn = kop_txn_sav;
+  if (opspec) {
+    opspec->kop_txn = kop_txn_sav;
+  }
   return rc;
 }
