@@ -293,7 +293,7 @@ class HseStore : public ObjectStore {
   hse_err_t kv_omap_put(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, std::string& omap_key,
     bufferlist& omap_value);
   hse_err_t kv_omap_read_entry(struct hse_kvdb_opspec *os, struct hse_kvs_cursor *cursor,
-    bool ceph_iterator, struct OmapBlk0 *blk0, std::string& omap_key, bufferlist *val_bl, bool& found);
+    bool ceph_iterator, struct OmapBlk0& blk0, std::string& omap_key, bufferlist *val_bl, bool& found);
   hse_err_t kv_omap_header_read(struct hse_kvdb_opspec *os, Onode& o, ceph::buffer::list *header,
       bool& found);
   hse_err_t kv_omap_create_hse_cursor(struct hse_kvdb_opspec *os, Onode& o,
@@ -493,15 +493,23 @@ private:
   struct hse_kvs *_collection_object_kvs = nullptr;
 
   // Key is hse_oid_t (8 bytes) + data block number (4 bytes)
-  // One data block aka 4kib
+  // Value is one data block worth of object data, aka 4kib
   struct hse_kvs *_object_data_kvs = nullptr;
 
   // Key is hse_oid_t (8 bytes) + xattr_key
-  // xattr_val
+  // Value is xattr_val
   struct hse_kvs *_object_xattr_kvs = nullptr;
 
+  // For the omap header.
+  // Key is the hse_oid_t (8 bytes).
+  // Value is the header ( assumed to smaller than 1MiB).
+  //
+  // For the omap key/value pairs:
   // Key is hse_oid_t (8 bytes) + omap_key + omap_block_number
-  // omap value (or part of it if not fitting in one block)
+  // Value is one block (1MiB) of the omap value.
+  // An omap value can be any size.
+  // If the value is bigger than 1MiB, several blocks are used. They are all 1MiB in size
+  // except the last one that may be smaller.
   struct hse_kvs *_object_omap_kvs = nullptr;
 
   HseStore::CollectionRef get_collection(coll_t cid);

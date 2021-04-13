@@ -310,7 +310,7 @@ HseStore::OmapIteratorImpl::OmapIteratorImpl(CollectionRef c, Onode& o) : _c(c),
   hse_err_t rc;
   std::string hse_key;
 
-  dout(10) << __func__ << " entering hse_oid " <<  _o.o_hse_oid << _o.o_oid << dendl;
+  dout(10) << __func__ << " entering hse_oid " <<  _o.o_hse_oid << " oid " << *_o.o_oid << dendl;
 
   _key_encode_u64(o.o_hse_oid, &hse_key);
   rc = this->_c->_store->hse_kvs_cursor_create_wrapper(this->_c->_store->_object_omap_kvs,
@@ -344,7 +344,7 @@ hse_err_t HseStore::kv_omap_read_entry(
     struct hse_kvdb_opspec *os,
     struct hse_kvs_cursor *cursor,
     bool ceph_iterator,
-    struct OmapBlk0 *blk0, // in/out
+    struct OmapBlk0 &blk0, // in/out
     std::string& omap_key, // out
     bufferlist* val_bl, // out
     bool& found)
@@ -365,12 +365,12 @@ hse_err_t HseStore::kv_omap_read_entry(
   if (val_bl)
     val_bl->clear();
 
-  if (blk0->already_read) {
-    blk0->already_read = false;
+  if (blk0.already_read) {
+    blk0.already_read = false;
 
     // The first block has already been read, use the result of that read.
 
-    if (blk0->hse_val_len < OMAP_BLOCK_LEN) {
+    if (blk0.hse_val_len < OMAP_BLOCK_LEN) {
       // Only one block for the value of this omap entry.
       done = true;
 
@@ -384,16 +384,16 @@ hse_err_t HseStore::kv_omap_read_entry(
     if (val_bl) {
       if (need_copy) {
         // Copy takes place
-        val_bl->append(blk0->hse_val, blk0->hse_val_len);
+        val_bl->append(blk0.hse_val, blk0.hse_val_len);
       } else {
         // No copy.
-        bufferptr ptr(buffer::create_static(blk0->hse_val_len, (char *)blk0->hse_val));
+        bufferptr ptr(buffer::create_static(blk0.hse_val_len, (char *)blk0.hse_val));
         val_bl->append(ptr);
       }
     }
 
     // Extract the omap key from the hse key.
-    hse_key_str.assign(blk0->hse_key);
+    hse_key_str.assign(blk0.hse_key);
     block_nb = HseStore::object_omap_hse_key2block_nb(hse_key_str);
     ceph_assert(!block_nb);
     HseStore::object_omap_hse_key2omap_key(hse_key_str, omap_key);
@@ -480,10 +480,10 @@ hse_err_t HseStore::kv_omap_read_entry(
 
 	done = true;
 
-	blk0->already_read = true;
-        blk0->hse_key.assign(hse_key, hse_key_len);
-	blk0->hse_val = hse_val;
-	blk0->hse_val_len = hse_val_len;
+	blk0.already_read = true;
+        blk0.hse_key.assign(hse_key, hse_key_len);
+	blk0.hse_val = hse_val;
+	blk0.hse_val_len = hse_val_len;
 
       } else {
 	//
@@ -579,7 +579,7 @@ int HseStore::OmapIteratorImpl::seek_to_first()
     hse_key_found.assign(seek_found, seek_found_len);
     ceph_assert(HseStore::object_omap_hse_key2block_nb(hse_key_found) == 0);
 
-    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, _blk0, _omap_key, &_value, found);
     if (rc)
       goto end;
 
@@ -624,12 +624,11 @@ int HseStore::OmapIteratorImpl::upper_bound(const string &after)
     hse_key_found.assign(seek_found, seek_found_len);
     ceph_assert(HseStore::object_omap_hse_key2block_nb(hse_key_found) == 0);
 
-    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, _blk0, _omap_key, &_value, found);
     if (rc)
       goto end;
 
     ceph_assert(found);
-    std::string omap_key;
     _valid = true;
   }
 
@@ -665,7 +664,7 @@ int HseStore::OmapIteratorImpl::lower_bound(const string &to)
     hse_key_found.assign(seek_found, seek_found_len);
     ceph_assert(HseStore::object_omap_hse_key2block_nb(hse_key_found) == 0);
 
-    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+    rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, _blk0, _omap_key, &_value, found);
     if (rc)
       goto end;
 
@@ -693,7 +692,7 @@ int HseStore::OmapIteratorImpl::next()
 
   _valid = false;
 
-  rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, &_blk0, _omap_key, &_value, found);
+  rc = this->_c->_store->kv_omap_read_entry(_os, _cursor, true, _blk0, _omap_key, &_value, found);
   if (rc)
       goto end;
 
@@ -3138,7 +3137,7 @@ int HseStore::omap_get_keys(
   }
 
   do {
-    rc = kv_omap_read_entry(nullptr, cursor, false, &blk0, omap_key, nullptr, found);
+    rc = kv_omap_read_entry(nullptr, cursor, false, blk0, omap_key, nullptr, found);
     if (rc)
       goto end;
     if (found)
@@ -3184,7 +3183,7 @@ int HseStore::omap_get_values(
   // Loop on the input keys
   //
 
-  for(auto key : keys) {
+  for(const auto& key : keys) {
     bufferlist val_bl;
     std::string hse_key;
     std::string omap_key;
@@ -3205,7 +3204,7 @@ int HseStore::omap_get_values(
     if (hse_key.compare(seek_found))
       continue;
 
-    rc = kv_omap_read_entry(nullptr, cursor, false, &blk0, omap_key, &val_bl, found);
+    rc = kv_omap_read_entry(nullptr, cursor, false, blk0, omap_key, &val_bl, found);
     if (rc)
       goto end;
 
@@ -3297,7 +3296,7 @@ int HseStore::omap_get(CollectionHandle &ch, const ghobject_t &oid, ceph::buffer
     bufferlist val_bl;
     std::string omap_key;
 
-    rc = kv_omap_read_entry(nullptr, cursor, false, &blk0, omap_key, &val_bl, found);
+    rc = kv_omap_read_entry(nullptr, cursor, false, blk0, omap_key, &val_bl, found);
     if (rc)
       goto end;
     if (found)
