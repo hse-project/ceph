@@ -53,13 +53,15 @@ extern "C" {
 
 #define DATA_BLOCK_LEN (1ULL << DATA_BLOCK_SHIFT)
 
-// Maximum object data block number that HseStore can handle.
+// Maximum object data block number or omap value block that HseStore can handle.
 #define MAX_BLOCK_NB ((1ULL << 32) -1) // INT_MAX
 // Maximum amount of data in one object, in bytes.
 #define MAX_DATA_LEN ((MAX_BLOCK_NB + 1)*DATA_BLOCK_LEN)
 
 #define OBJECT_DATA_KEY_LEN (sizeof(hse_oid_t) + sizeof(uint32_t))
 
+#define OMAP_BLOCK_SHIFT 20
+#define OMAP_BLOCK_LEN (1ULL << OMAP_BLOCK_SHIFT) // 1MiB
 // Size of the omap block number at the end of the key used in the kvs object_omap
 #define OMAP_BLOCK_NB_LEN (sizeof(uint32_t))
 
@@ -253,6 +255,10 @@ class HseStore : public ObjectStore {
   ceph::unordered_map<coll_t, CollectionRef> coll_map;
   std::map<coll_t, CollectionRef> new_coll_map;
 
+
+  // To iterate over an object map (omap).
+  class OmapIteratorImpl;
+
   //
   // Ceph Finisher worker thread used to call the Ceph callbacks (Context).
   //
@@ -281,12 +287,21 @@ class HseStore : public ObjectStore {
     bufferlist& bl);
 
   hse_err_t kv_create_obj(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o);
-  hse_err_t kv_omap_rm_one_kv(struct hse_kvdb_opspec *os, Onode& o, const std::string& omap_key);
+  hse_err_t kv_omap_rm_entry(struct hse_kvdb_opspec *os, Onode& o, const std::string& omap_key);
   hse_err_t kv_update_obj_data_len(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
     uint64_t object_data_len);
+  hse_err_t kv_omap_put(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, std::string& omap_key,
+    bufferlist& omap_value);
+  hse_err_t kv_omap_read_entry(struct hse_kvdb_opspec *os, struct hse_kvs_cursor *cursor,
+    bool ceph_iterator, struct OmapBlk0& blk0, std::string& omap_key, bufferlist *val_bl, bool& found);
+  hse_err_t kv_omap_header_read(struct hse_kvdb_opspec *os, Onode& o, ceph::buffer::list *header,
+      bool& found);
+  hse_err_t kv_omap_create_hse_cursor(struct hse_kvdb_opspec *os, Onode& o,
+    struct hse_kvs_cursor **cursor);
 
 
-  uint32_t object_data_key2block_nb(std::string& object_data_key);
+
+  uint32_t object_data_hse_key2block_nb(std::string& object_data_hse_key);
   uint32_t block_offset(uint64_t offset);
   uint32_t end_block_length(uint64_t offset, size_t length);
   uint32_t append_zero_blocks_in_bl(int32_t first_block_nb, int32_t last_block_nb, bufferlist& bl,
@@ -294,9 +309,17 @@ class HseStore : public ObjectStore {
 
   void omap_hse_key(hse_oid_t hse_oid, const std::string& omap_key, uint32_t omap_block_nb,
     std::string *omap_block_hse_key);
+  static uint32_t object_omap_hse_key2block_nb(std::string& object_omap_hse_key);
+  void object_omap_hse_key2omap_key(std::string& object_omap_kse_key, std::string& omap_key);
 
-  hse_err_t _omap_rmkeys(CollectionRef& c, Onode& o, bufferlist& keys_bl);
 
+
+
+  hse_err_t _omap_rmkeys(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, bufferlist& keys_bl);
+  hse_err_t _omap_setkeys(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, bufferlist& keys_bl);
+
+  hse_err_t hse_kvs_cursor_create_wrapper(struct hse_kvs *kvs, struct hse_kvdb_opspec *opspec,
+    const void *filt, size_t filt_len, struct hse_kvs_cursor **cursor);
   hse_err_t hse_kvs_cursor_seek_wrapper(struct hse_kvs_cursor *cursor,
     struct hse_kvdb_opspec *opspec, const void *key, size_t key_len, const void **found,
     size_t * found_len);
@@ -425,25 +448,15 @@ public:
   }
 
   int omap_get(CollectionHandle &c, const ghobject_t &oid, ceph::buffer::list *header,
-    std::map<std::string, ceph::buffer::list> *out) override {
-    return -EOPNOTSUPP;
-  }
+    std::map<std::string, ceph::buffer::list> *out) override;
 
   int omap_get_header(CollectionHandle &c, const ghobject_t &oid,
-    ceph::buffer::list *header, bool allow_eio = false) override {
-    return -EOPNOTSUPP;
-  }
+    ceph::buffer::list *header, bool allow_eio = false) override;
 
-  int omap_get_keys(CollectionHandle &c, const ghobject_t &oid,
-    std::set<std::string> *keys) override {
-    return -EOPNOTSUPP;
-  }
+  int omap_get_keys(CollectionHandle &c, const ghobject_t &oid, std::set<std::string> *keys) override;
 
-  int omap_get_values(CollectionHandle &c, const ghobject_t &oid,
-    const std::set<std::string> &keys,
-    std::map<std::string, ceph::buffer::list> *out) override {
-    return -EOPNOTSUPP;
-  }
+  int omap_get_values(CollectionHandle &c, const ghobject_t &oid, const std::set<std::string> &keys,
+    std::map<std::string, ceph::buffer::list> *out) override;
 
 #ifdef WITH_SEASTAR
   int omap_get_values(CollectionHandle &c, const ghobject_t &oid,
@@ -453,10 +466,8 @@ public:
   }
 #endif
 
-  int omap_check_keys(CollectionHandle &c, const ghobject_t &oid,
-      const std::set<std::string> &keys, std::set<std::string> *out) override {
-    return -EOPNOTSUPP;
-  }
+  int omap_check_keys(CollectionHandle &ch, const ghobject_t &oid,
+      const std::set<std::string> &keys, std::set<std::string> *out) override;
 
   ObjectMap::ObjectMapIterator get_omap_iterator(CollectionHandle &c, const ghobject_t &oid) override;
 
@@ -482,20 +493,83 @@ private:
   struct hse_kvs *_collection_object_kvs = nullptr;
 
   // Key is hse_oid_t (8 bytes) + data block number (4 bytes)
-  // One data block aka 4kib
+  // Value is one data block worth of object data, aka 4kib
   struct hse_kvs *_object_data_kvs = nullptr;
 
   // Key is hse_oid_t (8 bytes) + xattr_key
-  // xattr_val
+  // Value is xattr_val
   struct hse_kvs *_object_xattr_kvs = nullptr;
 
+  // For the omap header.
+  // Key is the hse_oid_t (8 bytes).
+  // Value is the header ( assumed to smaller than 1MiB).
+  //
+  // For the omap key/value pairs:
   // Key is hse_oid_t (8 bytes) + omap_key + omap_block_number
-  // omap value (or part of it if not fitting in one block)
+  // Value is one block (1MiB) of the omap value.
+  // An omap value can be any size.
+  // If the value is bigger than 1MiB, several blocks are used. They are all 1MiB in size
+  // except the last one that may be smaller.
   struct hse_kvs *_object_omap_kvs = nullptr;
 
   HseStore::CollectionRef get_collection(coll_t cid);
 
   friend class Syncer;
+};
+
+
+// This is to handle the case where the last block of an omap value is full.
+// In this case, when reading (cursor read) the blocks of the value of an omap entry, we only know
+// when to stop after having encountered eof or read the first value block of the next omap_entry.
+// OmapBlk0 contains what has been read from the first block of the next omap entry.
+// Its content will be use when we advance to the next omap entry.
+struct OmapBlk0 {
+    bool already_read; // true is the below is populated with valid values.
+    std::string hse_key;
+    const char *hse_val; // Not the whole omap entry value, only the first block.
+    size_t hse_val_len;
+
+  OmapBlk0() : already_read(false) {}
+};
+
+class HseStore::OmapIteratorImpl : public ObjectMap::ObjectMapIteratorImpl {
+  CollectionRef _c;
+  Onode _o;
+  struct hse_kvs_cursor *_cursor; // cursor on _object_omap_kvs
+  struct hse_kvdb_opspec *_os; // options for _cursor
+
+  // Data of the current omap entry. Aka the entry pointed to by this iterator.
+  // Updated each time the cursor is re-positioned.
+  bool _valid; // false is eof is encountered when moving this cursor.
+  std::string _omap_key;
+  bufferlist _value; // points on buffers allocated by the connector and will be freed by Ceph
+		      // or points on only one buffer allocated by hse and that will be freed
+		      // by hse when the cursor moves or is destroyed. In this case the omap value
+		      // is smaller (strictly) that the omap block size.
+
+  struct OmapBlk0 _blk0;
+
+public:
+  OmapIteratorImpl(CollectionRef c, Onode& o);
+  ~OmapIteratorImpl();
+
+  int seek_to_first() override;
+
+  // Make the iterator to point to the first element in the omap whose key is considered
+  // to go after k (strict).
+  int upper_bound(const string &after) override;
+
+  // Make the iterator to point to the first element in the omap whose key is not
+  // considered to go before k (i.e., either it is equivalent or goes after).
+  int lower_bound(const string &to) override;
+
+  bool valid() override;
+  int next() override;
+  string key() override;
+  bufferlist value() override;
+  int status() override {
+    return 0;
+  }
 };
 
 //
