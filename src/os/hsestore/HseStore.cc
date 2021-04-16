@@ -365,6 +365,10 @@ hse_err_t HseStore::kv_omap_read_entry(
   if (val_bl)
     val_bl->clear();
 
+
+  //
+  // Get the first block (block 0)
+  //
   if (blk0.already_read) {
     blk0.already_read = false;
 
@@ -734,8 +738,7 @@ HseStore::HseStore(CephContext *cct, const std::string& path)
   mprotect(zbuf, sizeof(zbuf), PROT_READ);
 }
 
-HseStore::~HseStore()
-{}
+HseStore::~HseStore() {}
 
 ObjectStore::CollectionHandle HseStore::open_collection(const coll_t &cid)
 {
@@ -1098,6 +1101,57 @@ int HseStore::queue_transactions(
   return 0;
 }
 
+hse_err_t HseStore::kv_retrieve_hse_oid(void)
+{
+  const std::string hse_oid_key(CEPH_METADATA_GENERAL_KEY("hse_oid"));
+  bool found;
+  uint64_t val;
+  size_t val_len;
+  hse_err_t rc;
+
+  rc = hse_kvs_get(_ceph_metadata_kvs, nullptr, hse_oid_key.c_str(), hse_oid_key.length(),
+    &found, &val, sizeof(val), &val_len);
+  if (rc) {
+    dout(10) << __func__ << " failed to get hse_oid" << dendl;
+    return rc;
+  }
+  if (found) {
+    const char *p;
+    uint64_t host_val;
+
+    ceph_assert(val_len == sizeof(val));
+    p = (char *)(&val);
+    _key_decode_u64(p, &host_val);
+    _next_hse_oid = host_val;
+  } else {
+    _next_hse_oid = 0;
+  }
+
+  dout(10) << __func__ << " exiting, _next_hse_oid " << _next_hse_oid  << dendl;
+
+  return 0;
+}
+
+hse_err_t HseStore::kv_save_hse_oid(void)
+{
+  const std::string hse_oid_key(CEPH_METADATA_GENERAL_KEY("hse_oid"));
+  uint64_t val;
+  std::string valc;
+  hse_err_t rc;
+
+  dout(10) << __func__ << " entering, _next_hse_oid " << _next_hse_oid  << dendl;
+
+  val = _next_hse_oid;
+  _key_encode_u64(val, &valc);
+  ceph_assert(valc.length() == sizeof(val));
+  rc = hse_kvs_put(_ceph_metadata_kvs, nullptr, hse_oid_key.c_str(), hse_oid_key.length(),
+    valc.c_str(), valc.length());
+  if (rc) {
+    dout(10) << __func__ << " failed to persist hse_oid" << dendl;
+  }
+  return rc;
+}
+
 int HseStore::mount()
 {
   hse_err_t rc = 0;
@@ -1154,6 +1208,12 @@ int HseStore::mount()
   rc = hse_kvdb_kvs_open(_kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr, &_object_omap_kvs);
   if (rc) {
     dout(10) << " failed to open the object-omap kvs" << dendl;
+    goto end;
+  }
+
+  rc = HseStore::kv_retrieve_hse_oid();
+  if (rc) {
+    dout(10) << __func__ << "failed to retrieve the hse_oid counter" << dendl;
     goto end;
   }
 
@@ -1217,6 +1277,12 @@ int HseStore::umount()
 {
   hse_err_t rc = 0;
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
+
+  rc = HseStore::kv_save_hse_oid();
+  if (rc) {
+    dout(10) << __func__ << " failed to save the hse_oid counter" << dendl;
+    // continue anyway.
+  }
 
   /* HSE_TODO: how to handle error logic here */
   rc = hse_kvdb_kvs_close(_ceph_metadata_kvs);
@@ -1923,6 +1989,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
   hse_err_t rc = 0;
   HSE_KVDB_OPSPEC_INIT(&os);
   Transaction::iterator i = t->begin();
+
+  dout(10) << __func__ << " entering " << c->cid << dendl;
 
   //
   // Start a hse transaction.
@@ -3241,7 +3309,7 @@ int HseStore::omap_check_keys(
   // Loop on the input keys
   //
 
-  for(auto key : keys) {
+  for(const auto& key : keys) {
     std::string hse_key;
     size_t val_len;
 

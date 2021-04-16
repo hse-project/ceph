@@ -326,6 +326,8 @@ class HseStore : public ObjectStore {
   hse_err_t hse_kvs_cursor_read_wrapper(struct hse_kvs_cursor *cursor,
     struct hse_kvdb_opspec *opspec, const void **key, size_t *key_len, const void **val,
     size_t *val_len, bool *eof);
+  hse_err_t kv_retrieve_hse_oid(void);
+  hse_err_t kv_save_hse_oid(void);
 
 
 
