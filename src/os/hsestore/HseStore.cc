@@ -137,21 +137,32 @@ void HseStore::Collection::flush()
   return;
 }
 
+#pragma push_macro("dout_prefix")
+#pragma push_macro("dout_context")
+#undef dout_prefix
+#undef dout_context
+#define dout_prefix *_dout << "hsestore "
+#define dout_context _store->cct
+
 bool HseStore::Collection::flush_commit(Context *ctx)
 {
-  if ((_t_seq_persisted_latest + 1 == _t_seq_next) || (_t_seq_next == 0)) {
+  if (_t_seq_persisted_latest + 1 == _t_seq_next) {
     // All transactions persisted.
+    dout(10) << __func__ << " return true" << dendl;
     return true;
   }
 
   // Queue the sync request to the syncer thread
-  _syncer->post_sync(this, ctx, _t_seq_next - 1);
+  _store->_syncer->post_sync(this, ctx, _t_seq_next - 1);
 
+  dout(10) << __func__ << " return false" << dendl;
   return false;
 }
 
 void HseStore::Collection::queue_wait_persist(Context *ctx, uint64_t t_seq) {
 	TxnWaitPersist *twp = new TxnWaitPersist(ctx, t_seq);
+
+  dout(10) << __func__ << " entering seq " << t_seq << dendl;
 
   boost::unique_lock<std::mutex> lock(_committed_wait_persist_mtx);
   _committed_wait_persist.push_back(twp);
@@ -172,6 +183,12 @@ void HseStore::Collection::committed_wait_persist_cb(HseStore::Collection *c)
 
     c->_committed_wait_persist.pop_front();
     lock.unlock();
+
+#pragma push_macro("dout_context")
+#undef dout_context
+#define dout_context c->_store->cct
+    dout(10) << __func__ << " seq " << twp->_t_seq << dendl;
+#pragma pop_macro("dout_context")
 
     // Invoke the Ceph "commit" callback.
     c->_store->finisher.queue(twp->_persist_ctx);
@@ -212,6 +229,8 @@ void HseStore::Collection::get_onode(
       o.o_dirty = true;
   }
 }
+#pragma pop_macro("dout_prefix")
+#pragma pop_macro("dout_context")
 
 
 //
@@ -276,6 +295,12 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
     Syncer::kvdb_sync(c->_store);
   }
 
+#pragma push_macro("dout_context")
+#undef dout_context
+#define dout_context c->_store->cct
+  dout(10) << __func__ << " calling flush commit context, persisted seq " <<
+    c->_t_seq_persisted_latest << dendl;
+#pragma pop_macro("dout_context")
   // Call the flush_commit() callback.
   c->_store->finisher.queue(ctx);
 }
@@ -283,7 +308,8 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
 void Syncer::timer_cb(const boost::system::error_code& e, boost::asio::deadline_timer* timer,
     HseStore* store)
 {
-  Syncer::kvdb_sync(store);
+  if (store->_ready_for_sync)
+    Syncer::kvdb_sync(store);
 
   // Restart the timer.
   timer->expires_from_now(boost::posix_time::milliseconds(SYNCER_PERIOD_MS));
@@ -365,6 +391,10 @@ hse_err_t HseStore::kv_omap_read_entry(
   if (val_bl)
     val_bl->clear();
 
+
+  //
+  // Get the first block (block 0)
+  //
   if (blk0.already_read) {
     blk0.already_read = false;
 
@@ -727,6 +757,7 @@ bufferlist HseStore::OmapIteratorImpl::value()
 
 HseStore::HseStore(CephContext *cct, const std::string& path)
   : ObjectStore(cct, path),
+    _syncer(new Syncer(this)),
     finisher(cct),
     kvdb_name(cct->_conf->hsestore_kvdb)
 {
@@ -734,8 +765,7 @@ HseStore::HseStore(CephContext *cct, const std::string& path)
   mprotect(zbuf, sizeof(zbuf), PROT_READ);
 }
 
-HseStore::~HseStore()
-{}
+HseStore::~HseStore() {}
 
 ObjectStore::CollectionHandle HseStore::open_collection(const coll_t &cid)
 {
@@ -1090,12 +1120,67 @@ int HseStore::queue_transactions(
     // The "commit" Ceph callback will be invoked later when the transaction
     // is persisted by the syncer.
     //
-    c->queue_wait_persist(t.get_on_commit(), c->_t_seq_next++);
+    contexts = t.get_on_commit();
+    if (contexts)
+      c->queue_wait_persist(contexts, c->_t_seq_next);
+
+    c->_t_seq_next++;
   }
 
   // The WaitCondTs destructor (variable ts) will wakeup the next queue_transactions()
   // thread waiting to run on the collection.
   return 0;
+}
+
+hse_err_t HseStore::kv_retrieve_hse_oid(void)
+{
+  const std::string hse_oid_key(CEPH_METADATA_GENERAL_KEY("hse_oid"));
+  bool found;
+  uint64_t val;
+  size_t val_len;
+  hse_err_t rc;
+
+  rc = hse_kvs_get(_ceph_metadata_kvs, nullptr, hse_oid_key.c_str(), hse_oid_key.length(),
+    &found, &val, sizeof(val), &val_len);
+  if (rc) {
+    dout(10) << __func__ << " failed to get hse_oid" << dendl;
+    return rc;
+  }
+  if (found) {
+    const char *p;
+    uint64_t host_val;
+
+    ceph_assert(val_len == sizeof(val));
+    p = (char *)(&val);
+    _key_decode_u64(p, &host_val);
+    _next_hse_oid = host_val;
+  } else {
+    _next_hse_oid = 0;
+  }
+
+  dout(10) << __func__ << " exiting, _next_hse_oid " << _next_hse_oid  << dendl;
+
+  return 0;
+}
+
+hse_err_t HseStore::kv_save_hse_oid(void)
+{
+  const std::string hse_oid_key(CEPH_METADATA_GENERAL_KEY("hse_oid"));
+  uint64_t val;
+  std::string valc;
+  hse_err_t rc;
+
+  dout(10) << __func__ << " entering, _next_hse_oid " << _next_hse_oid  << dendl;
+
+  val = _next_hse_oid;
+  _key_encode_u64(val, &valc);
+  ceph_assert(valc.length() == sizeof(val));
+  rc = hse_kvs_put(_ceph_metadata_kvs, nullptr, hse_oid_key.c_str(), hse_oid_key.length(),
+    valc.c_str(), valc.length());
+  if (rc) {
+    dout(10) << __func__ << " failed to persist hse_oid" << dendl;
+  }
+  return rc;
 }
 
 int HseStore::mount()
@@ -1157,6 +1242,12 @@ int HseStore::mount()
     goto end;
   }
 
+  rc = HseStore::kv_retrieve_hse_oid();
+  if (rc) {
+    dout(10) << __func__ << "failed to retrieve the hse_oid counter" << dendl;
+    goto end;
+  }
+
   struct hse_kvs_cursor *cursor;
   rc = hse_kvs_cursor_create_wrapper(_collection_kvs, nullptr, nullptr, 0, &cursor);
   if (rc) {
@@ -1199,7 +1290,10 @@ int HseStore::mount()
   if (!fsid.parse(reinterpret_cast<char *>(fsid_buf))) {
     dout(10) << " failed to parse fsid" << dendl;
     rc = ENOTRECOVERABLE;
+    goto destroy;
   }
+
+  finisher.start();
 
 destroy:
   rc1 = hse_kvs_cursor_destroy(cursor);
@@ -1209,6 +1303,10 @@ destroy:
       rc = rc1;
   }
 
+  if (!rc)
+    _ready_for_sync = true;
+
+
 end:
   return rc ? -hse_err_to_errno(rc) : 0;
 }
@@ -1217,6 +1315,15 @@ int HseStore::umount()
 {
   hse_err_t rc = 0;
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
+
+  rc = HseStore::kv_save_hse_oid();
+  if (rc) {
+    dout(10) << __func__ << " failed to save the hse_oid counter" << dendl;
+    // continue anyway.
+  }
+
+  finisher.wait_for_empty();
+  finisher.stop();
 
   /* HSE_TODO: how to handle error logic here */
   rc = hse_kvdb_kvs_close(_ceph_metadata_kvs);
@@ -1286,6 +1393,7 @@ int HseStore::mkfs()
   // 36 is length of UUID, +1 for NUL byte
   uint8_t old_fsid_buf[37] = { 0 };
   std::string fsid_str;
+  struct hse_params *params = NULL;
 
   rc = hse_kvdb_init();
   if (rc) {
@@ -1317,25 +1425,32 @@ int HseStore::mkfs()
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(_kvdb, COLLECTION_OBJECT_KVS_NAME.data(), nullptr);
+  hse_params_create(&params);
+  hse_params_set(params, "kvs.pfx_len", "14"); // coll_t2key
+
+  rc = hse_kvdb_kvs_make(_kvdb, COLLECTION_OBJECT_KVS_NAME.data(), params);
   if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the collection-object kvs" << dendl;
     goto kvdb_out;
   }
+  hse_params_destroy(params);
 
-  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr);
+  hse_params_create(&params);
+  hse_params_set(params, "kvs.pfx_len", "8"); // hse_oid_t
+
+  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_DATA_KVS_NAME.data(), params);
   if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the object-data kvs" << dendl;
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_XATTR_KVS_NAME.data(), params);
   if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the object-xattr kvs" << dendl;
     goto kvdb_out;
   }
 
-  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_OMAP_KVS_NAME.data(), nullptr);
+  rc = hse_kvdb_kvs_make(_kvdb, OBJECT_OMAP_KVS_NAME.data(), params);
   if (rc && hse_err_to_errno(rc) != EEXIST) {
     dout(10) << " failed to make the object-omap kvs" << dendl;
     goto kvdb_out;
@@ -1399,6 +1514,8 @@ kvdb_out:
   }
 err_out:
   hse_kvdb_fini();
+  if (params)
+    hse_params_destroy(params);
 
   return rc && hse_err_to_errno(rc) != EEXIST ? -hse_err_to_errno(rc) : 0;
 }
@@ -1924,6 +2041,8 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
   HSE_KVDB_OPSPEC_INIT(&os);
   Transaction::iterator i = t->begin();
 
+  dout(10) << __func__ << " entering " << c->cid << dendl;
+
   //
   // Start a hse transaction.
   //
@@ -2091,11 +2210,13 @@ void HseStore::start_one_transaction(Collection *c, Transaction *t)
 	r = _truncate(txc, c, o, off);
       }
       break;
+#endif
 
     case Transaction::OP_REMOVE:
-	r = _remove(txc, c, o);
+      rc = kv_remove_obj(&os, c, o);
       break;
 
+#if 0
     case Transaction::OP_SETATTR:
       {
         string name = i.decode_string();
@@ -2544,6 +2665,14 @@ static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string 
   }
 }
 
+void HseStore::collection_object_hse_key(CollectionRef& c, Onode& o, std::string *key)
+{
+  key->clear();
+  key->append(c->_coll_tkey);
+  key->append(o.o_ghobject_tkey);
+  _key_encode_u64(o.o_hse_oid, key);
+}
+
 /*
  * Get the hse_oid from the ghobject_t looking in _collection_object_kvs
  */
@@ -2693,7 +2822,7 @@ static int key2ghobject_t(const std::string_view key, ghobject_t &oid)
 }
 
 /*
- * Convert a coll_t into a 10 bytes "key"
+ * Convert a coll_t into a 14 bytes "key"
  * The order on coll_t is defined by coll_t::operator<
  * The first byte of the output, letter P, T or M  maintain that order.
  * The output is always 14 bytes: 1 (type) + 1 (shard) + 4 (seed) + 8 (pool)
@@ -2761,9 +2890,8 @@ hse_err_t HseStore::kv_update_obj_data_len(
   std::string key;
   std::string sval;
 
-  key.append(c->_coll_tkey);
-  key.append(o.o_ghobject_tkey);
-  _key_encode_u64(o.o_hse_oid, &key);
+  collection_object_hse_key(c, o, &key);
+
   _key_encode_u64(object_data_len, &sval); // 8 bytes
 
   rc = hse_kvs_put(_collection_object_kvs, os, key.c_str(), key.length(),
@@ -2788,7 +2916,8 @@ hse_err_t HseStore::kv_create_obj(
 
   o.o_hse_oid = this->_next_hse_oid++;
 
-  dout(10) << __func__ << " " << *o.o_oid << " hse_oid " << o.o_hse_oid << dendl;
+  dout(10) << __func__ << " " << *o.o_oid << " hse_oid " << o.o_hse_oid << " t_seq " <<
+    c->_t_seq_next << dendl;
 
   rc = HseStore::kv_update_obj_data_len(os, c, o, 0);
   if (rc) {
@@ -2797,6 +2926,70 @@ hse_err_t HseStore::kv_create_obj(
   }
   o.o_exists = true;
   return rc;
+}
+
+hse_err_t HseStore::kv_remove_obj(
+  struct hse_kvdb_opspec *os,
+  CollectionRef& c,
+  Onode& o)
+{
+  hse_err_t rc;
+  std::string prefix;
+
+  if (!o.o_exists)
+    return 0;
+
+  dout(10) << __func__ << " exists, removing oid " <<
+      *o.o_oid << " hse_oid " << o.o_hse_oid << dendl;
+    
+  _key_encode_u64(o.o_hse_oid, &prefix);
+
+  //
+  // Remove object xattr
+  //
+  rc = hse_kvs_prefix_delete(_object_xattr_kvs, os, prefix.c_str(), prefix.length(),
+    nullptr);
+  if (rc) {
+    dout(10) << __func__ << " failed to prefix delete object from _object_xattr_kvs oid " <<
+      *o.o_oid << dendl;
+    return rc;
+  }
+ 
+  //
+  // Remove object omap
+  //
+  rc = hse_kvs_prefix_delete(_object_omap_kvs, os, prefix.c_str(), prefix.length(),
+    nullptr);
+  if (rc) {
+    dout(10) << __func__ << " failed to prefix delete object from _object_omap_kvs oid " <<
+      *o.o_oid << dendl;
+    return rc;
+  }
+
+  //
+  // Remove object data
+  //
+  rc = hse_kvs_prefix_delete(_object_data_kvs, os, prefix.c_str(), prefix.length(),
+    nullptr);
+  if (rc) {
+    dout(10) << __func__ << " failed to prefix delete object from _object_data_kvs oid " <<
+      *o.o_oid << dendl;
+    return rc;
+  }
+
+  //
+  // Remove the association object-collection
+  //
+  collection_object_hse_key(c, o, &prefix);
+  rc = hse_kvs_delete(_collection_object_kvs, os, prefix.c_str(), prefix.length());
+  if (rc) {
+    dout(10) << __func__ << " failed to delete object from _collection_object_kvs oid " <<
+      *o.o_oid << dendl;
+    return rc;
+  }
+
+  o.o_exists = false;
+  return 0;
 }
 
 /* Temporary hack, TODO */
@@ -3241,7 +3434,7 @@ int HseStore::omap_check_keys(
   // Loop on the input keys
   //
 
-  for(auto key : keys) {
+  for(const auto& key : keys) {
     std::string hse_key;
     size_t val_len;
 
