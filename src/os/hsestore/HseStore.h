@@ -154,7 +154,8 @@ class HseStore : public ObjectStore {
   using hse_oid_t = uint64_t;
 
   private:
-  Syncer *_syncer;
+  bool _ready_for_sync = false;
+  std::unique_ptr<Syncer> _syncer;
   //
   // Next hse_oid to assign to a new Ceph object.
   std::atomic<uint64_t> _next_hse_oid;
@@ -193,7 +194,6 @@ class HseStore : public ObjectStore {
   class Collection : public ObjectStore::CollectionImpl {
     std::string _coll_tkey;
     HseStore *_store;
-    Syncer *_syncer;
     TransactionSerialization _ts;
 
     // The transactions are assigned a sequence number when they are queued.
@@ -203,15 +203,15 @@ class HseStore : public ObjectStore {
     // number also mean "highest" sequence number.
 
     // sqn for next txn to be queued.
-    uint64_t _t_seq_next;
+    uint64_t _t_seq_next = 1;
 
     // txns up to _t_seq_committed_sync are waiting to be synced/persisted
     // When a sync starts, the sync thread copies _t_seq_committed_latest into
     // _t_seq_committed_wait_sync
-    uint64_t _t_seq_committed_wait_sync;
+    uint64_t _t_seq_committed_wait_sync = 0;
 
     // txns up to _t_seq_persisted_latest have been synced/persisted
-    uint64_t _t_seq_persisted_latest;
+    uint64_t _t_seq_persisted_latest = 0;
 
     void flush() override;
     bool flush_commit(Context *c) override;
@@ -276,6 +276,7 @@ class HseStore : public ObjectStore {
     hse_oid_t& hse_oid, uint64_t& o_data_len);
 
   void offset2object_data_key(const hse_oid_t &hse_oid, uint64_t offset, std::string *key);
+  void collection_object_hse_key(CollectionRef& c, Onode& o, std::string *key);
 
   hse_err_t kv_create_collection(struct hse_kvdb_opspec *os, const coll_t &cid, unsigned bits);
 
@@ -287,6 +288,7 @@ class HseStore : public ObjectStore {
     bufferlist& bl);
 
   hse_err_t kv_create_obj(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o);
+  hse_err_t kv_remove_obj(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o);
   hse_err_t kv_omap_rm_entry(struct hse_kvdb_opspec *os, Onode& o, const std::string& omap_key);
   hse_err_t kv_update_obj_data_len(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
     uint64_t object_data_len);
@@ -486,25 +488,30 @@ private:
   struct hse_kvdb *_kvdb = nullptr;
   struct hse_kvs *_ceph_metadata_kvs = nullptr;;
 
-  // Key is coll_t2key
+  // Key is coll_t2key (14 bytes)
   // No value
+  // Prefix is coll_t2key
   struct hse_kvs *_collection_kvs = nullptr;
 
-  // Key is coll_t2key + hse_oid_t (8 bytes)
+  // Key is coll_t2key (14 bytes) + ghobject_t2key + hse_oid_t (8 bytes)
   // Value is the length of the object data (8 bytes)
+  // Prefix is coll_t2key
   struct hse_kvs *_collection_object_kvs = nullptr;
 
   // Key is hse_oid_t (8 bytes) + data block number (4 bytes)
   // Value is one data block worth of object data, aka 4kib
+  // Prefix is hse_oid_t
   struct hse_kvs *_object_data_kvs = nullptr;
 
   // Key is hse_oid_t (8 bytes) + xattr_key
   // Value is xattr_val
+  // Prefix is hse_oid_t
   struct hse_kvs *_object_xattr_kvs = nullptr;
 
   // For the omap header.
   // Key is the hse_oid_t (8 bytes).
   // Value is the header ( assumed to smaller than 1MiB).
+  // Prefix is hse_oid_t
   //
   // For the omap key/value pairs:
   // Key is hse_oid_t (8 bytes) + omap_key + omap_block_number
@@ -577,14 +584,15 @@ public:
 //
 // Handle syncing transactions. Aka making mutation done via transactions persistent.
 //
-#define SYNCER_PERIOD_MS 50 // Sync every 50 ms.
+//#define SYNCER_PERIOD_MS 50 // Sync every 50 ms.
+#define SYNCER_PERIOD_MS 10000 // Sync every 10 sec
 class Syncer {
   HseStore *_store;
 
   // Work queue used by the syncer, contains sync requests (flush_commit())
-  boost::asio::io_service _sync_wq;
+  boost::asio::io_context _sync_wq;
 
-  boost::asio::io_service::work _work;
+  boost::asio::io_context::work _work;
   boost::asio::deadline_timer _timer;
 
   // Thread group for the thread running the _sync_wq
@@ -608,7 +616,7 @@ public:
   }
 
   // Constructor
-  Syncer() : _work(_sync_wq), _timer(_sync_wq, boost::posix_time::milliseconds(SYNCER_PERIOD_MS))
+  Syncer(HseStore *store) : _store (store), _work(_sync_wq), _timer(_sync_wq, boost::posix_time::milliseconds(SYNCER_PERIOD_MS))
   {
 
     // Only one thread to serve the work queue to avoid processing work items in parallel.
