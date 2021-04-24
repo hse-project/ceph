@@ -320,6 +320,14 @@ class HseStore : public ObjectStore {
   hse_err_t _omap_rmkeys(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, bufferlist& keys_bl);
   hse_err_t _omap_setkeys(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, bufferlist& keys_bl);
 
+  hse_err_t _setxattrs(struct hse_kvdb_opspec *os, CollectionRef& c,
+    Onode& o, const map<string,bufferptr>& aset);
+  hse_err_t _rmxattr(struct hse_kvdb_opspec *os, CollectionRef& c,
+    Onode& o, const string& name);
+  hse_err_t  _rmxattrs(struct hse_kvdb_opspec *os, CollectionRef& c,
+    Onode& o);
+
+
   hse_err_t hse_kvs_cursor_create_wrapper(struct hse_kvs *kvs, struct hse_kvdb_opspec *opspec,
     const void *filt, size_t filt_len, struct hse_kvs_cursor **cursor);
   hse_err_t hse_kvs_cursor_seek_wrapper(struct hse_kvs_cursor *cursor,
@@ -475,6 +483,7 @@ public:
 
   ObjectMap::ObjectMapIterator get_omap_iterator(CollectionHandle &c, const ghobject_t &oid) override;
 
+
   void set_fsid(uuid_d u) override { fsid = u; }
   uuid_d get_fsid() override { return fsid; }
 
@@ -585,7 +594,7 @@ public:
 // Handle syncing transactions. Aka making mutation done via transactions persistent.
 //
 //#define SYNCER_PERIOD_MS 50 // Sync every 50 ms.
-#define SYNCER_PERIOD_MS 10000 // Sync every 10 sec
+#define SYNCER_PERIOD_MS 1000 // Sync every 1 sec
 class Syncer {
   HseStore *_store;
 
