@@ -305,6 +305,7 @@ class HseStore : public ObjectStore {
 
   uint32_t object_data_hse_key2block_nb(std::string& object_data_hse_key);
   uint32_t block_offset(uint64_t offset);
+  bool same_data_block(uint64_t offset, size_t length);
   uint32_t end_block_length(uint64_t offset, size_t length);
   uint32_t append_zero_blocks_in_bl(int32_t first_block_nb, int32_t last_block_nb, bufferlist& bl,
     uint32_t first_offset, uint32_t last_length);
