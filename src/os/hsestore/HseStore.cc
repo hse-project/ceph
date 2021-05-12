@@ -307,11 +307,25 @@ void Syncer::do_sync(HseStore::Collection *c, Context *ctx, uint64_t t_seq_commi
 void Syncer::timer_cb(const boost::system::error_code& e, boost::asio::deadline_timer* timer,
     HseStore* store)
 {
+  std::clock_t c_start;
+  std::clock_t c_end;
+  float sync_ms;
+  uint32_t wait_ms;
+
+  c_start = std::clock();
   if (store->_ready_for_sync)
     Syncer::kvdb_sync(store);
 
+  c_end = std::clock();
+
+  sync_ms = (1000.0 * (c_end - c_start)) / CLOCKS_PER_SEC;
+  if (sync_ms >= SYNCER_PERIOD_MS)
+    wait_ms = 0;
+  else
+    wait_ms = SYNCER_PERIOD_MS - sync_ms;
+
   // Restart the timer.
-  timer->expires_from_now(boost::posix_time::milliseconds(SYNCER_PERIOD_MS));
+  timer->expires_from_now(boost::posix_time::milliseconds(wait_ms));
   timer->async_wait(boost::bind(Syncer::timer_cb,
         boost::asio::placeholders::error, timer, store));
 }
@@ -887,6 +901,115 @@ err_out:
   return rc;
 }
 
+int HseStore::collection_list(CollectionHandle &ch, const ghobject_t &start,
+  const ghobject_t &end, int max, std::vector<ghobject_t> *ls, ghobject_t *next)
+{
+  hse_err_t rc;
+  hse_err_t rc1;
+  const void *foundkey = nullptr;
+  size_t foundkey_len;
+  struct hse_kvs_cursor *cursor;
+  std::string ghobject_tkey_start;
+  std::string ghobject_tkey_end;
+  std::string filt_min;
+  std::string filt_max;
+  int i;
+
+  Collection *c = static_cast<Collection*>(ch.get());
+
+  ghobject_t2key(cct, start, &ghobject_tkey_start);
+  ghobject_t2key(cct, end, &ghobject_tkey_end);
+
+
+  //
+  // Limit the cursor to one collection
+  //
+  rc = hse_kvs_cursor_create_wrapper(_collection_object_kvs, nullptr,
+      c->_coll_tkey.c_str(), c->_coll_tkey.size(), &cursor);
+  if (rc) {
+    dout(10) << __func__ << " failed to create cursor with collection " <<
+      c->cid << dendl;
+    goto end;
+  }
+
+  //
+  // Seek to the beginning of the range of objects.
+  //
+  filt_min.append(c->_coll_tkey);
+  filt_min.append(ghobject_tkey_start);
+  filt_max.append(c->_coll_tkey);
+  filt_max.append(ghobject_tkey_end);
+  filt_max.append(sizeof(hse_oid_t), 0xFF);
+
+  rc = hse_kvs_cursor_seek_range(cursor, nullptr, filt_min.c_str(),
+    filt_min.length(), filt_max.c_str(), filt_max.length(), &foundkey, &foundkey_len);
+  if (rc) {
+    dout(10) << __func__ << " failed to seek, collection " << c->cid << dendl;
+    goto destroy;
+  }
+
+  if (!foundkey_len) {
+    // No object in the range.
+    if (next != nullptr)
+      *next = ghobject_t::get_max();
+    goto destroy;
+  }
+
+  for (i = 0; i < max + 1; i++) {
+    const char *hse_key;
+    size_t hse_key_len;
+    std::string hse_key_str;
+    int ret;
+    std::string ghobject_t_key;
+    ghobject_t oid;
+    bool eof;
+    const void *val;
+    size_t val_len;
+
+    rc = hse_kvs_cursor_read_wrapper(cursor, nullptr,
+	reinterpret_cast<const void **>(&hse_key), &hse_key_len, &val, &val_len, &eof);
+    if (rc) {
+      dout(10) << __func__ << " failed to read from cursor, collection "
+        << c->cid << dendl;
+      goto destroy;
+    }
+
+    if (eof) {
+      if (next != nullptr)
+	*next = ghobject_t::get_max();
+      break;
+    }
+    hse_key_str.assign(hse_key, hse_key_len);
+    HseStore::collection_object_hse_key2ghobject_t_key(hse_key_str, ghobject_t_key);
+    ret = key2ghobject_t(ghobject_t_key, oid);
+    if (ret) {
+      dout(10) << __func__ << " key to ghobject_t failed " << c->cid << dendl;
+      rc = -ret;
+      goto destroy;
+    }
+
+    if (i == max) {
+      if (next != nullptr)
+	*next = oid;
+      break;
+    }
+
+    ls->push_back(oid);
+  }
+
+destroy:
+  rc1 = hse_kvs_cursor_destroy(cursor);
+  if (rc1) {
+    dout(10) << __func__ << " failed to destroy the cursor in collection " <<
+      c->cid << dendl;
+    if (!rc)
+      rc = rc1;
+  }
+
+end:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
 /*
  * TODO "bits" are ignored and not saved.
  */
@@ -964,8 +1087,11 @@ hse_err_t HseStore::split_collection(
   while (!eof) {
     const uint8_t *key;
     size_t key_len;
+    const void *val;
+    size_t val_len;
+
     rc = hse_kvs_cursor_read_wrapper(cursor, os, reinterpret_cast<const void **>(&key),
-      &key_len, nullptr, nullptr, &eof);
+      &key_len, &val, &val_len, &eof);
     if (rc) {
       dout(10) << " failed to read from cursor while splitting collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
@@ -1045,8 +1171,11 @@ hse_err_t HseStore::merge_collection(
   while (!eof) {
     const uint8_t *key;
     size_t key_len;
+    const void *val;
+    size_t val_len;
+
     rc = hse_kvs_cursor_read_wrapper(cursor, os, reinterpret_cast<const void **>(&key),
-      &key_len, nullptr, nullptr, &eof);
+      &key_len, &val, &val_len, &eof);
     if (rc) {
       dout(10) << " failed to read from cursor while merging collections ("
         << old_cid << "->" << new_cid << ')' << dendl;
@@ -1195,17 +1324,22 @@ int HseStore::mount()
   uint8_t fsid_buf[37] = { 0 };
   size_t fsid_len;
   std::unique_lock<ceph::shared_mutex> l{coll_lock};
+  struct hse_params *params = NULL;
 
   rc = hse_kvdb_init();
   if (rc) {
     goto end;
   }
 
-  rc = hse_kvdb_open(kvdb_name.data(), nullptr, &_kvdb);
+  hse_params_create(&params);
+  hse_params_set(params, "kvdb.perfc_enable", "3");
+  rc = hse_kvdb_open(kvdb_name.data(), params, &_kvdb);
   if (rc) {
     dout(10) << " failed to open the kvdb" << dendl;
+    hse_params_destroy(params);
     goto end;
   }
+  hse_params_destroy(params);
 
   /* HSE_TODO: how to handle error logic here */
   rc = hse_kvdb_kvs_open(_kvdb, CEPH_METADATA_KVS_NAME.data(), nullptr, &_ceph_metadata_kvs);
@@ -1226,11 +1360,15 @@ int HseStore::mount()
     goto end;
   }
 
-  rc = hse_kvdb_kvs_open(_kvdb, OBJECT_DATA_KVS_NAME.data(), nullptr, &_object_data_kvs);
+  hse_params_create(&params);
+  hse_params_set(params, "kvs.cn_cursor_vra", "131072");
+  rc = hse_kvdb_kvs_open(_kvdb, OBJECT_DATA_KVS_NAME.data(), params, &_object_data_kvs);
   if (rc) {
     dout(10) << " failed to open the object-data kvs" << dendl;
+    hse_params_destroy(params);
     goto end;
   }
+  hse_params_destroy(params);
 
   rc = hse_kvdb_kvs_open(_kvdb, OBJECT_XATTR_KVS_NAME.data(), nullptr, &_object_xattr_kvs);
   if (rc) {
@@ -1568,11 +1706,30 @@ uint32_t HseStore::object_omap_hse_key2block_nb(
 // Return the ceph omap key from the hse key used in kvs _object_omap_kvs
 // (hse_oid + ceph omap entry key + encoded block number)
 void HseStore::object_omap_hse_key2omap_key(
-    std::string& object_omap_kse_key,
+    std::string& object_omap_hse_key,
     std::string& omap_key)
 {
-  omap_key = object_omap_kse_key.substr(sizeof(hse_oid_t),
-      object_omap_kse_key.length() - sizeof(hse_oid_t) - sizeof(uint32_t));
+  omap_key = object_omap_hse_key.substr(sizeof(hse_oid_t),
+      object_omap_hse_key.length() - sizeof(hse_oid_t) - sizeof(uint32_t));
+}
+
+// Return the ceph xattr key from the hse key used in kvs _object_xattr_kvs
+// (hse_oid + ceph xattr entry key)
+void HseStore::object_xattr_hse_key2xattr_key(
+    std::string& object_xattr_hse_key,
+    std::string& xattr_key)
+{
+  xattr_key = object_xattr_hse_key.substr(sizeof(hse_oid_t),
+      object_xattr_hse_key.length() - sizeof(hse_oid_t));
+}
+
+// Return the ghobject_t key from the hse key used in kvs _collection_object_kvs
+void HseStore::collection_object_hse_key2ghobject_t_key(
+    std::string& collection_object_hse_key,
+    std::string& ghobject_t_key)
+{
+  ghobject_t_key = collection_object_hse_key.substr(ENCODED_KEY_COLL,
+      collection_object_hse_key.length() - sizeof(hse_oid_t) - ENCODED_KEY_COLL);
 }
 
 // Append buffers (each block sized and zero filled) in the buffer list "bl".
@@ -1702,9 +1859,6 @@ hse_err_t HseStore::kv_read_data(
   //   buffers are hooked up to bl.
   bl.clear();
 
-  start_block_key.reserve(sizeof(hse_oid_t) + sizeof(uint32_t));
-  cursor_block_key.reserve(sizeof(hse_oid_t) + sizeof(uint32_t));
-
   start_block_offset = block_offset(offset);
   start_block_rel_offset = offset - start_block_offset;
   offset2object_data_key(o.o_hse_oid, start_block_offset, &start_block_key);
@@ -1794,9 +1948,10 @@ hse_err_t HseStore::kv_read_data(
     uint32_t block_rel_offset;
     uint32_t block_rel_length;
     int32_t cursor_block_nb;
+    const char *key;
 
     rc = hse_kvs_cursor_read_wrapper(cursor, os,
-      reinterpret_cast<const void **>(&cursor_block_key),
+      reinterpret_cast<const void **>(&key),
       &cursor_block_key_len, reinterpret_cast<const void **>(&val), &val_len, &eof);
     if (rc) {
       dout(10) << __func__ << " cursor read failed" << dendl;
@@ -1810,6 +1965,7 @@ hse_err_t HseStore::kv_read_data(
     } else {
       ceph_assert(cursor_block_key_len == OBJECT_DATA_KEY_LEN);
       ceph_assert(val_len == DATA_BLOCK_LEN);
+      cursor_block_key.assign(key, cursor_block_key_len);
       cursor_block_nb = object_data_hse_key2block_nb(cursor_block_key);
       if (cursor_block_nb > end_block_nb + 1) {
 	cursor_block_nb  = end_block_nb + 1;
@@ -2645,6 +2801,11 @@ static void ghobject_t2key(CephContext *cct, const ghobject_t& oid, std::string 
 {
   key->clear();
 
+  if (oid.is_max()) {
+    key->append(HSE_KVS_KLEN_MAX - ENCODED_KEY_COLL - sizeof(HseStore::hse_oid_t), 0xFF);
+    return;
+  }
+
   size_t max_len = ENCODED_KEY_PREFIX_LEN +
                   (oid.hobj.nspace.length() * 3 + 1) +
                   (oid.hobj.get_key().length() * 3 + 1) +
@@ -3104,8 +3265,8 @@ hse_err_t HseStore::kv_omap_rm_entry(
   const void *seek_found;
   size_t seek_found_len;
 
-  dout(10) << __func__ << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
-	   << dendl;
+  dout(10) << __func__ << " " << *o.o_oid << " hse_oid " << o.o_hse_oid << " key " <<
+	   omap_key.c_str() << dendl;
 
   //
   // Create a cursor with (hse oid + omap key) as filter.
@@ -3204,7 +3365,7 @@ hse_err_t HseStore::kv_omap_put(
   size_t omap_block_hse_key_len;
 
   dout(10) << __func__ << " " << c->cid << " " << *o.o_oid << " hse_oid " << o.o_hse_oid
-	   << dendl;
+	   << " key " << omap_key.c_str() << dendl;
 
   // The hse key is hse_oid + omap_key + block number
   omap_hse_key(o.o_hse_oid, omap_key, 0, &omap_block_hse_key);
@@ -3429,23 +3590,28 @@ int HseStore::omap_get_values(
     bufferlist val_bl;
     std::string hse_key;
     std::string omap_key;
+    std::string hse_key_found;
 
     blk0.already_read = false;
     hse_key.clear();
 
     omap_hse_key(o.o_hse_oid, key, 0, &hse_key);
 
+    dout(10) << __func__ << " " << oid << " searching key " << key.c_str() << dendl;
+
     rc = HseStore::hse_kvs_cursor_seek_wrapper(cursor, nullptr, hse_key.c_str(), hse_key.length(),
       (const void **)&seek_found, &seek_found_len);
-    if (!rc)
+    if (rc)
       goto end;
 
     if (!seek_found_len)
       continue;
 
-    if (hse_key.compare(seek_found))
+    hse_key_found.assign(seek_found, seek_found_len);
+    if (hse_key.compare(hse_key_found))
       continue;
 
+    dout(10) << __func__ << " " << oid << " key found " << key.c_str() << dendl;
     rc = kv_omap_read_entry(nullptr, cursor, false, blk0, omap_key, &val_bl, found);
     if (rc)
       goto end;
@@ -3622,6 +3788,127 @@ hse_err_t  HseStore::_rmxattrs(
       *o.o_oid << dendl;
   }
   return rc;
+}
+
+int HseStore::getattr(
+  CollectionHandle& ch,
+  const ghobject_t& oid,
+  const char *name,
+  bufferptr& value)
+{
+  Collection *c;
+  hse_err_t rc;
+  std::string k(name);
+  Onode o;
+  std::string xattr_hse_key;
+  bool found;
+  size_t val_len;
+
+  dout(10) << __func__ << " " << ch->cid << " " << oid << " " << name << dendl;
+
+  c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    rc = ENOENT;
+    goto end;
+  }
+
+  _key_encode_u64(o.o_hse_oid, &xattr_hse_key);
+  xattr_hse_key.append(k);
+  rc = hse_kvs_get(_object_xattr_kvs, nullptr, xattr_hse_key.c_str(),
+      xattr_hse_key.length(), &found, write_buf, OMAP_BLOCK_LEN, &val_len);
+
+  if (rc) {
+    dout(10) << __func__ << " hse_kvs_get() failed " << dendl;
+    goto end;
+  }
+  if (!found) {
+    rc = ENODATA;
+    goto end;
+  }
+
+  ceph_assert(val_len <= OMAP_BLOCK_LEN);
+  {
+    bufferptr ptr(val_len);
+    ptr.copy_in(0, val_len, (char *)write_buf);
+    value = ptr;
+  }
+
+end:
+  return rc ? -hse_err_to_errno(rc) : 0;
+}
+
+int HseStore::getattrs(
+  CollectionHandle& ch,
+  const ghobject_t& oid,
+  map<string,bufferptr>& aset)
+{
+  Collection *c;
+  Onode o;
+  hse_err_t rc;
+  std::string hse_key_str;
+  struct hse_kvs_cursor *cursor;
+  bool eof;
+  const char *seek_found;
+  size_t seek_found_len;
+
+  dout(10) << __func__ << " " << ch->cid << " " << oid << dendl;
+
+  c = static_cast<Collection*>(ch.get());
+  c->get_onode(o, oid, false);
+  if (!o.o_exists) {
+    dout(10) << __func__ << " object doesn't exist " << oid << dendl;
+    return -ENOENT;
+  }
+
+  // Limit the cursor to the object.
+  _key_encode_u64(o.o_hse_oid, &hse_key_str);
+  rc = hse_kvs_cursor_create_wrapper(_object_xattr_kvs, nullptr, hse_key_str.c_str(),
+      hse_key_str.length(), &cursor);
+  if (rc) {
+    dout(10) << __func__ << " failed to create cursor " << oid << dendl;
+    return -hse_err_to_errno(rc);
+  }
+
+  rc = HseStore::hse_kvs_cursor_seek_wrapper(cursor, nullptr, hse_key_str.c_str(),
+      hse_key_str.length(), (const void **)&seek_found, &seek_found_len);
+  if (rc) {
+    dout(10) << __func__ << " failed to seek " << oid << dendl;
+    goto end;
+  }
+  if (!seek_found_len) {
+    rc = ENODATA;
+    goto end;
+  }
+
+  do {
+    const char *hse_key;
+    size_t hse_key_len;
+    const char *hse_val;
+    size_t hse_val_len;
+    std::string xattr_key;
+
+    rc = hse_kvs_cursor_read_wrapper(cursor, nullptr,
+	reinterpret_cast<const void **>(&hse_key), &hse_key_len,
+	reinterpret_cast<const void **>(&hse_val), &hse_val_len, &eof);
+    if (rc) {
+      dout(10) << __func__ << " failed cursor read " << oid << dendl;
+      goto end;
+    }
+    if (eof)
+      break;
+
+    hse_key_str.assign(hse_key, hse_key_len);
+    HseStore::object_xattr_hse_key2xattr_key(hse_key_str, xattr_key);
+    aset.insert({xattr_key, bufferptr(hse_val, hse_val_len)});
+
+  } while (true);
+
+end:
+  hse_kvs_cursor_destroy(cursor);
+  return rc ? -hse_err_to_errno(rc) : 0;
+
 }
 
 /*
