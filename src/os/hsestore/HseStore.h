@@ -313,7 +313,10 @@ class HseStore : public ObjectStore {
   void omap_hse_key(hse_oid_t hse_oid, const std::string& omap_key, uint32_t omap_block_nb,
     std::string *omap_block_hse_key);
   static uint32_t object_omap_hse_key2block_nb(std::string& object_omap_hse_key);
-  void object_omap_hse_key2omap_key(std::string& object_omap_kse_key, std::string& omap_key);
+  void object_omap_hse_key2omap_key(std::string& object_omap_hse_key, std::string& omap_key);
+  void object_xattr_hse_key2xattr_key(std::string& object_xattr_hse_key,
+    std::string& xattr_key);
+void collection_object_hse_key2ghobject_t_key(std::string& collection_object_hse_key, std::string& ghobject_t_key);
 
 
 
@@ -436,14 +439,10 @@ public:
   }
 
   int getattr(CollectionHandle &c, const ghobject_t& oid,
-    const char *name, ceph::buffer::ptr& value) override {
-    return -EOPNOTSUPP;
-  }
+    const char *name, ceph::buffer::ptr& value) override;
 
   int getattrs(CollectionHandle &c, const ghobject_t &oid,
-      std::map<std::string, ceph::buffer::ptr> &aset) override {
-    return -EOPNOTSUPP;
-  }
+      std::map<std::string, ceph::buffer::ptr> &aset) override;
 
   int list_collections(vector<coll_t>& ls) override;
 
@@ -456,9 +455,8 @@ public:
   }
 
   int collection_list(CollectionHandle &c, const ghobject_t &start,
-    const ghobject_t &end, int max, std::vector<ghobject_t> *ls, ghobject_t *next) override {
-    return -EOPNOTSUPP;
-  }
+    const ghobject_t &end, int max, std::vector<ghobject_t> *ls,
+    ghobject_t *next) override;
 
   int omap_get(CollectionHandle &c, const ghobject_t &oid, ceph::buffer::list *header,
     std::map<std::string, ceph::buffer::list> *out) override;
@@ -594,8 +592,8 @@ public:
 //
 // Handle syncing transactions. Aka making mutation done via transactions persistent.
 //
-//#define SYNCER_PERIOD_MS 50 // Sync every 50 ms.
-#define SYNCER_PERIOD_MS 1000 // Sync every 1 sec
+#define SYNCER_PERIOD_MS 20 // Sync every 20 ms.
+//#define SYNCER_PERIOD_MS 1000 // Sync every 1 sec
 class Syncer {
   HseStore *_store;
 
