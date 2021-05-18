@@ -65,6 +65,7 @@ extern "C" {
 // Size of the omap block number at the end of the key used in the kvs object_omap
 #define OMAP_BLOCK_NB_LEN (sizeof(uint32_t))
 
+#define HSE_OID_SAFE_INTERVAL 10000
 
 
 class WaitCond {
@@ -178,7 +179,7 @@ class HseStore : public ObjectStore {
     // True if the object is KVS collection_object_kvs
     bool o_exists;
     hse_oid_t o_hse_oid;
-    uint64_t o_data_len; // Total length of the object data (from offset 0 to last byte).
+    uint64_t o_data_len; // Total length of the object data (from offset 0 to last byte, may have holes, and even no data at all (truncate)).
 
     // Object not yet in KVS collection_object_kvs, but the operation will create the object and
     // put it in the KVS.
@@ -292,10 +293,10 @@ class HseStore : public ObjectStore {
   hse_err_t kv_omap_rm_entry(struct hse_kvdb_opspec *os, Onode& o, const std::string& omap_key);
   hse_err_t kv_update_obj_data_len(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
     uint64_t object_data_len);
-  hse_err_t kv_omap_put(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, std::string& omap_key,
-    bufferlist& omap_value);
-  hse_err_t kv_omap_read_entry(struct hse_kvdb_opspec *os, struct hse_kvs_cursor *cursor,
-    bool ceph_iterator, struct OmapBlk0& blk0, std::string& omap_key, bufferlist *val_bl, bool& found);
+  hse_err_t kv_omap_put(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, std::string& omap_key, bufferlist& omap_value);
+  hse_err_t kv_omap_put_header(struct hse_kvdb_opspec *os, CollectionRef& c,
+  Onode& o, bufferlist& omap_header);
+  hse_err_t kv_omap_read_entry(struct hse_kvdb_opspec *os, struct hse_kvs_cursor *cursor, struct OmapBlk0& blk0, std::string& omap_key, bufferlist *val_bl, bool& found);
   hse_err_t kv_omap_header_read(struct hse_kvdb_opspec *os, Onode& o, ceph::buffer::list *header,
       bool& found);
   hse_err_t kv_omap_create_hse_cursor(struct hse_kvdb_opspec *os, Onode& o,
@@ -306,6 +307,7 @@ class HseStore : public ObjectStore {
   uint32_t object_data_hse_key2block_nb(std::string& object_data_hse_key);
   uint32_t block_offset(uint64_t offset);
   bool same_data_block(uint64_t offset, size_t length);
+  uint32_t start_block_length(uint64_t offset, size_t length);
   uint32_t end_block_length(uint64_t offset, size_t length);
   uint32_t append_zero_blocks_in_bl(int32_t first_block_nb, int32_t last_block_nb, bufferlist& bl,
     uint32_t first_offset, uint32_t last_length);
@@ -313,7 +315,6 @@ class HseStore : public ObjectStore {
   void omap_hse_key(hse_oid_t hse_oid, const std::string& omap_key, uint32_t omap_block_nb,
     std::string *omap_block_hse_key);
   static uint32_t object_omap_hse_key2block_nb(std::string& object_omap_hse_key);
-  void object_omap_hse_key2omap_key(std::string& object_omap_hse_key, std::string& omap_key);
   void object_xattr_hse_key2xattr_key(std::string& object_xattr_hse_key,
     std::string& xattr_key);
 void collection_object_hse_key2ghobject_t_key(std::string& collection_object_hse_key, std::string& ghobject_t_key);
@@ -323,6 +324,13 @@ void collection_object_hse_key2ghobject_t_key(std::string& collection_object_hse
 
   hse_err_t _omap_rmkeys(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, bufferlist& keys_bl);
   hse_err_t _omap_setkeys(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o, bufferlist& keys_bl);
+  hse_err_t _omap_setheader(struct hse_kvdb_opspec *os, CollectionRef& c,
+    Onode& o, bufferlist& bl);
+  hse_err_t _omap_clear(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o);
+  hse_err_t _omap_rmkey_range(struct hse_kvdb_opspec *os, CollectionRef& c,
+    Onode& o, const string& first, const string& last);
+
+
 
   hse_err_t _setxattrs(struct hse_kvdb_opspec *os, CollectionRef& c,
     Onode& o, const map<string,bufferptr>& aset);
@@ -330,6 +338,11 @@ void collection_object_hse_key2ghobject_t_key(std::string& collection_object_hse
     Onode& o, const string& name);
   hse_err_t  _rmxattrs(struct hse_kvdb_opspec *os, CollectionRef& c,
     Onode& o);
+
+  hse_err_t _truncate(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
+      uint64_t length);
+  hse_err_t _zero(struct hse_kvdb_opspec *os, CollectionRef& c, Onode& o,
+    uint64_t offset, size_t length);
 
 
   hse_err_t hse_kvs_cursor_create_wrapper(struct hse_kvs *kvs, struct hse_kvdb_opspec *opspec,
@@ -416,9 +429,7 @@ public:
     return -EOPNOTSUPP;
   }
 
-  int stat(CollectionHandle &c, const ghobject_t &oid, struct stat *st, bool allow_eio = false) override {
-    return -EOPNOTSUPP;
-  }
+  int stat(CollectionHandle &c, const ghobject_t &oid, struct stat *st, bool allow_eio = false) override;
 
   int read(
     CollectionHandle &c,
@@ -522,7 +533,7 @@ private:
   // Prefix is hse_oid_t
   //
   // For the omap key/value pairs:
-  // Key is hse_oid_t (8 bytes) + omap_key + omap_block_number
+  // Key is hse_oid_t (8 bytes) + escaped(omap_key) + omap_block_number (4 bytes)
   // Value is one block (1MiB) of the omap value.
   // An omap value can be any size.
   // If the value is bigger than 1MiB, several blocks are used. They are all 1MiB in size
@@ -593,8 +604,9 @@ public:
 // Handle syncing transactions. Aka making mutation done via transactions persistent.
 //
 #define SYNCER_PERIOD_MS 20 // Sync every 20 ms.
-//#define SYNCER_PERIOD_MS 1000 // Sync every 1 sec
 class Syncer {
+  using hse_oid_t = uint64_t;
+
   HseStore *_store;
 
   // Work queue used by the syncer, contains sync requests (flush_commit())
@@ -606,6 +618,8 @@ class Syncer {
   // Thread group for the thread running the _sync_wq
   boost::thread_group _worker_threads;
 
+  // To persist the latest hse_oid from time to time
+  hse_oid_t _last_written_hse_oid = 0;
 
   static void timer_cb(const boost::system::error_code& e, boost::asio::deadline_timer* timer,
     HseStore* store);
@@ -615,6 +629,8 @@ class Syncer {
     uint64_t t_seq_committed_at_flush);
 
   static void kvdb_sync(HseStore *store);
+
+  void write_latest_hse_oid(HseStore *store);
 
 public:
   void post_sync(HseStore::Collection *c, Context *ctx,
